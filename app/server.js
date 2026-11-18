@@ -10,7 +10,7 @@ const { spawn } = require('child_process');
 const QRCode = require('qrcode');
 const K = require('./lib/kcrypto');
 const { Vault } = require('./lib/vault');
-const { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard } = require('./lib/system');
+const { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret } = require('./lib/system');
 
 const PORT = +process.env.KEYTURN_PORT || 7457;
 const RELAY = (process.env.KEYTURN_RELAY || 'https://keys.aiforge.uk').replace(/\/$/, '');
@@ -33,7 +33,7 @@ const cliToken = K.token(); // written to cli.token only once this copy is the o
 const launches = new Map(); // one-time window links: code -> expiry
 const usedLaunches = new Set();
 let copied = null;          // fingerprint of the value Keyturn last put on the clipboard
-const EXISTING_VAULT = `There is already a vault in ${DATA}, but its settings file (keyturn.json) is missing or damaged. Keyturn won’t replace your vault. Put keyturn.json back (keyturn.json.bak is the previous copy) and open Keyturn again.`;
+const EXISTING_VAULT = `There is already a vault in ${DATA}, but its settings file (keyturn.json) is missing or damaged. Keyturn won’t replace your vault. Open it with your recovery code (“Lost your phone?”), or put keyturn.json back (keyturn.json.bak is the previous copy) and open Keyturn again.`;
 
 let cfg = loadCfg();
 let session = null;      // { K, vault, expiresAt, timer }
@@ -195,11 +195,13 @@ async function confirmLink() {
       const vaultId = K.b64u.enc(K.random(16));
       const vault = await Vault.create(VAULT, key, 'Keyturn');
       const code = K.newRecoveryCode();
-      const rsalt = K.random(16);
+      const rec = await makeRecovery(code, key);
+      vault.setRecovery(rec);
+      await vault.save();
       cfg = {
-        v: 1, product: 'Keyturn', vaultId, prfSalt: K.b64u.enc(p.salt), relay: RELAY, minutes: 15, created: new Date().toISOString(),
-        devices: [device(data, credId, prf, key, vaultId)],
-        recovery: { salt: K.b64u.enc(rsalt), box: K.aesWrap(await K.recoveryWrapKey(code, rsalt), key, Buffer.from('recovery')) },
+        v: 2, product: 'Keyturn', vaultId, prfSalt: K.b64u.enc(p.salt), relay: RELAY, minutes: 15, created: new Date().toISOString(),
+        devices: [await device(data, credId, prf, key, vaultId)],
+        recovery: rec,
       };
       saveCfg();
       startSession(key, vault);
@@ -208,7 +210,7 @@ async function confirmLink() {
     } else {
       if (!session) throw httpErr(423, 'The vault locked before you confirmed.');
       if (cfg.devices.some((d) => d.cred === data.cred)) throw httpErr(409, 'This phone is already linked.');
-      const d = device(data, credId, prf, session.K, cfg.vaultId);
+      const d = await device(data, credId, prf, session.K, cfg.vaultId);
       cfg.devices.push(d);
       saveCfg();
       log('you', `Linked another phone: ${d.name}`);
@@ -228,22 +230,87 @@ async function handlePhone(p, msg) {
   const d = cfg.devices.find((x) => x.cred === data.cred);
   if (!d) throw httpErr(403, 'This passkey isn’t linked to this PC.');
   let key;
-  try { key = K.aesUnwrap(K.prfWrapKey(prf, cfg.vaultId), d.box, credId); } catch { throw httpErr(403, 'That key didn’t match.'); } finally { prf.fill(0); }
+  let upgrade = false;
+  try {
+    if (d.v === 2) {
+      const pcs = await secretOfPc(false);
+      if (!pcs) throw httpErr(403, 'This PC no longer recognises your phone (its Keyturn secret is missing). Open Keyturn with your recovery code, then link your phone again.');
+      key = K.openWith(K.phoneKey(prf, pcs, cfg.vaultId), d.box, credId);
+    } else {
+      key = K.aesUnwrap(K.prfWrapKey(prf, cfg.vaultId), d.box, credId);
+      upgrade = true;
+    }
+  } catch (e) { prf.fill(0); throw e.expose ? e : httpErr(403, 'That key didn’t match.'); }
   let vault;
-  try { vault = await Vault.open(VAULT, key); } catch (e) { key.fill(0); throw e; }
-  if (pending !== p) { key.fill(0); throw httpErr(409, 'Cancelled on the PC.'); } // Cancel or Lock was pressed while this was being checked
+  try { vault = await Vault.open(VAULT, key); } catch (e) { key.fill(0); prf.fill(0); throw e; }
+  if (pending !== p) { key.fill(0); prf.fill(0); throw httpErr(409, 'Cancelled on the PC.'); } // Cancel or Lock was pressed while this was being checked
+  if (upgrade) {
+    // First unlock since the update: re-seal this phone's box the new way (with this PC's secret).
+    const nd = await device(data, credId, prf, key, cfg.vaultId);
+    Object.assign(d, { v: 2, pub: nd.pub, box: nd.box });
+    log('system', `Upgraded ${d.name} to the new lock`);
+  }
+  prf.fill(0);
   d.lastUsed = new Date().toISOString();
   startSession(key, vault);
+  if (upgrade) saveCfg(true);
   log('you', `Unlocked with ${d.name}`);
   return { ok: true, message: 'Unlocked', detail: `for ${minutes()} minutes` };
 }
 
-function device(data, credId, prf, key, vaultId) {
+let pcSecretCache = null;
+async function secretOfPc(create) {
+  if (!pcSecretCache) pcSecretCache = await pcSecret(path.join(LOCAL, 'pc.secret'), create);
+  return pcSecretCache;
+}
+
+async function device(data, credId, prf, key, vaultId) {
+  const pub = K.pubOf(K.phoneKey(prf, await secretOfPc(true), vaultId));
   return {
     id: K.b64u.enc(K.random(6)), name: String(data.device || 'Phone').slice(0, 30), cred: data.cred,
-    created: new Date().toISOString(), lastUsed: null,
-    box: K.aesWrap(K.prfWrapKey(prf, vaultId), key, credId),
+    created: new Date().toISOString(), lastUsed: null, v: 2, pub,
+    box: K.sealTo(pub, key, credId),
   };
+}
+
+async function makeRecovery(code, key) {
+  const salt = K.random(16);
+  const pub = K.pubOf(await K.recoveryKey(code, salt));
+  return { v: 2, salt: K.b64u.enc(salt), pub, box: K.sealTo(pub, key, Buffer.from('recovery')) };
+}
+
+// Opens the vault key with the paper code: from keyturn.json, or from the vault file's own header.
+async function keyFromPaper(code) {
+  const tries = [cfg && cfg.recovery, Vault.readRecovery(VAULT)].filter(Boolean);
+  for (const rec of tries) {
+    try {
+      if (rec.v === 2) return { key: K.openWith(await K.recoveryKey(code, K.b64u.dec(rec.salt)), rec.box, Buffer.from('recovery')), rec };
+      return { key: K.aesUnwrap(await K.recoveryWrapKey(code, K.b64u.dec(rec.salt)), rec.box, Buffer.from('recovery')), rec };
+    } catch { /* wrong code, or this copy is older: try the next */ }
+  }
+  return null;
+}
+
+// New vault key, sealed again to every linked phone and the paper code. Old copies of keyturn.json (and of the
+// vault) keep only the old key, so an unlinked phone or a replaced paper code no longer opens the current vault.
+async function rekey({ newCode = false } = {}) {
+  needOpen();
+  const old = cfg.devices.filter((d) => d.v !== 2);
+  if (old.length) throw httpErr(409, `Unlock once with ${old.map((d) => d.name).join(' and ')} first (that finishes its upgrade), or unlink it.`);
+  if (!newCode && (!cfg.recovery || cfg.recovery.v !== 2)) throw httpErr(409, 'Check your recovery code once first: choose “Check my recovery code”.');
+  const K2 = K.random(32);
+  const code = newCode ? K.newRecoveryCode() : null;
+  const rec = newCode ? await makeRecovery(code, K2) : { ...cfg.recovery, box: K.sealTo(cfg.recovery.pub, K2, Buffer.from('recovery')) };
+  const devices = cfg.devices.map((d) => ({ ...d, box: K.sealTo(d.pub, K2, K.b64u.dec(d.cred)) }));
+  session.vault.setKey(K2);
+  session.vault.setRecovery(rec);
+  await session.vault.save({ scrub: true }); // if Keyturn stopped right here, the paper code in the vault header still opens it
+  cfg.recovery = rec;
+  cfg.devices = devices;
+  saveCfg(true);
+  session.K.fill(0);
+  session.K = K2;
+  return code;
 }
 
 // ---------- state for the app window ----------
@@ -256,8 +323,10 @@ function state() {
     minutes: minutes(),
     lastOpened: cfg && cfg.lastOpened,
     summary: session ? session.vault.summary() : (cfg && cfg.summary) || null,
-    devices: cfg ? cfg.devices.map((d) => ({ id: d.id, name: d.name, created: d.created, lastUsed: d.lastUsed })) : [],
+    devices: cfg ? cfg.devices.map((d) => ({ id: d.id, name: d.name, created: d.created, lastUsed: d.lastUsed, upgraded: d.v === 2 })) : [],
     hasRecovery: !!(cfg && cfg.recovery),
+    paperCheck: !!(cfg && cfg.recovery && cfg.recovery.v !== 2),       // old-style paper box: type the code once to upgrade it
+    vaultOnly: !cfg && fs.existsSync(VAULT) && !!Vault.readRecovery(VAULT), // settings file lost: the paper code still opens the vault
     pending: pending && { kind: pending.kind, status: pending.status, error: pending.error, qr: pending.qr, url: pending.url, code: pending.code, expiresAt: pending.expiresAt },
     recovery: freshRecovery,
     request,
@@ -389,21 +458,55 @@ async function ui(p, b) {
       recoveryTries = recoveryTries.filter((t) => now - t < 10 * 60000);
       if (recoveryTries.length >= 5) throw httpErr(429, 'Too many tries. Wait 10 minutes.');
       recoveryTries.push(now);
-      if (!cfg || !cfg.recovery) throw httpErr(409, 'No recovery code set');
-      let key;
-      try { key = K.aesUnwrap(await K.recoveryWrapKey(b.code, K.b64u.dec(cfg.recovery.salt)), cfg.recovery.box, Buffer.from('recovery')); } catch { throw httpErr(403, 'That code isn’t right. Check each group of four.'); }
-      startSession(key, await Vault.open(VAULT, key));
+      if (!fs.existsSync(VAULT)) throw httpErr(409, 'There is no vault on this PC yet.');
+      const found = await keyFromPaper(b.code);
+      if (!found) throw httpErr(403, 'That code isn’t right. Check each group of four.');
+      const vault = await Vault.open(VAULT, found.key);
+      const hadPcSecret = fs.existsSync(path.join(LOCAL, 'pc.secret'));
+      const notes = [];
+      if (!cfg) {
+        // keyturn.json was lost: rebuild it. Phones are linked again from inside the open vault.
+        cfg = { v: 2, product: 'Keyturn', vaultId: K.b64u.enc(K.random(16)), prfSalt: K.b64u.enc(K.random(32)), relay: RELAY, minutes: 15, created: new Date().toISOString(), devices: [], recovery: found.rec };
+        notes.push('Rebuilt the settings file from the vault');
+      } else if (!hadPcSecret && cfg.devices.some((d) => d.v === 2)) {
+        cfg.devices = cfg.devices.filter((d) => d.v !== 2); // sealed with a PC secret this PC doesn't have
+        notes.push('This PC is new to Keyturn, so link your phone again');
+      }
+      if (found.rec.v !== 2 || cfg.recovery !== found.rec || !Vault.readRecovery(VAULT)) {
+        // Bring the paper code's box up to date (new style, and in the vault header too).
+        cfg.recovery = await makeRecovery(b.code, found.key);
+        vault.setRecovery(cfg.recovery);
+        await vault.save({ scrub: true });
+      }
+      saveCfg(true);
+      startSession(found.key, vault);
       log('you', 'Unlocked with the recovery code');
+      for (const n of notes) log('system', n);
       return;
+    }
+    case '/api/recovery/check': {
+      // Type the paper code while open: proves it still works, and upgrades an old-style paper box.
+      needOpen();
+      const now = Date.now();
+      recoveryTries = recoveryTries.filter((t) => now - t < 10 * 60000);
+      if (recoveryTries.length >= 5) throw httpErr(429, 'Too many tries. Wait 10 minutes.');
+      recoveryTries.push(now);
+      const found = await keyFromPaper(b.code);
+      if (!found || !K.same(found.key, session.K)) throw httpErr(403, 'That isn’t this vault’s recovery code. Check each group of four.');
+      found.key.fill(0);
+      if (cfg.recovery.v !== 2 || !Vault.readRecovery(VAULT)) {
+        cfg.recovery = await makeRecovery(b.code, session.K);
+        session.vault.setRecovery(cfg.recovery);
+        await session.vault.save({ scrub: true });
+        saveCfg(true);
+        log('you', 'Checked the recovery code (and finished the upgrade)');
+      } else log('you', 'Checked the recovery code: it works');
+      return { ok: true };
     }
     case '/api/recovery/new': {
       needOpen();
-      const code = K.newRecoveryCode();
-      const rsalt = K.random(16);
-      cfg.recovery = { salt: K.b64u.enc(rsalt), box: K.aesWrap(await K.recoveryWrapKey(code, rsalt), session.K, Buffer.from('recovery')) };
-      saveCfg(true);
-      freshRecovery = code;
-      log('you', 'Made a new recovery code (the old one no longer works)');
+      freshRecovery = await rekey({ newCode: true });
+      log('you', 'Made a new recovery code. The old one no longer opens this vault, even from old backups');
       return;
     }
     case '/api/device/remove': {
@@ -411,9 +514,10 @@ async function ui(p, b) {
       const d = cfg.devices.find((x) => x.id === b.id);
       if (!d) throw httpErr(404, 'Not found');
       if (cfg.devices.length === 1 && !cfg.recovery) throw httpErr(409, 'This is your only way in.');
+      const before = cfg.devices;
       cfg.devices = cfg.devices.filter((x) => x !== d);
-      saveCfg(true);
-      log('you', `Unlinked ${d.name}`);
+      try { await rekey(); } catch (e) { cfg.devices = before; throw e; }
+      log('you', `Unlinked ${d.name}. It no longer opens this vault, even from old backups`);
       return;
     }
     case '/api/settings': {

@@ -17,6 +17,7 @@ kdbxweb.CryptoEngine.setArgon2Impl((password, salt, memory, iterations, length, 
 
 const WIRED = 'Keyturn: used in';
 const SOURCE = 'Keyturn: source';
+const RECOVERY = 'keyturn.recovery.v2';
 
 function creds(K) { return new kdbxweb.Credentials(null, new Uint8Array(K).buffer); }
 
@@ -37,12 +38,44 @@ class Vault {
     return new Vault(file, db);
   }
 
-  async save() {
+  // scrub: the .bak copy is replaced too, so it can't be opened with a key that was just retired.
+  async save({ scrub } = {}) {
     const buf = Buffer.from(await this.db.save());
     const tmp = this.file + '.tmp';
     fs.writeFileSync(tmp, buf);
     if (fs.existsSync(this.file)) fs.copyFileSync(this.file, this.file + '.bak');
     fs.renameSync(tmp, this.file);
+    if (scrub) fs.copyFileSync(this.file, this.file + '.bak');
+  }
+
+  // Change the vault key (used when a phone is unlinked or a new paper code is made).
+  setKey(K) { this.db.credentials = creds(K); }
+
+  // The paper code's sealed copy of the vault key also lives in the vault file's public header, so the
+  // paper code opens the vault even if keyturn.json is lost. It holds nothing usable without the code.
+  setRecovery(rec) {
+    if (!this.db.header.publicCustomData) this.db.header.publicCustomData = new kdbxweb.VarDictionary();
+    this.db.header.publicCustomData.set(RECOVERY, kdbxweb.VarDictionary.ValueType.String, JSON.stringify(rec));
+  }
+
+  // Read that copy without opening the vault (KDBX 4 outer header: id, 4-byte length, data; id 12 = public custom data).
+  static readRecovery(file) {
+    try {
+      const buf = fs.readFileSync(file);
+      if (buf.readUInt16LE(10) !== 4) return null;
+      for (let o = 12; o + 5 <= buf.length;) {
+        const id = buf[o];
+        const len = buf.readUInt32LE(o + 1);
+        const data = buf.subarray(o + 5, o + 5 + len);
+        o += 5 + len;
+        if (id === 0) break;
+        if (id === 12) {
+          const v = kdbxweb.VarDictionary.read(new kdbxweb.BinaryStream(new Uint8Array(data).buffer)).get(RECOVERY);
+          return v ? JSON.parse(String(v)) : null;
+        }
+      }
+    } catch { /* unreadable */ }
+    return null;
   }
 
   root() { return this.db.getDefaultGroup(); }

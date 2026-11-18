@@ -112,6 +112,27 @@ const setClipboard = (v) => ps(`${UTF8}Add-Type -AssemblyName System.Windows.For
   foreach($f in 'ExcludeClipboardContentFromMonitorProcessing','CanIncludeInClipboardHistory','CanUploadToCloudClipboard'){ $d.SetData($f, (New-Object IO.MemoryStream(,[byte[]](0,0,0,0)))) }
   [Windows.Forms.Clipboard]::SetDataObject($d, $true, 10, 50)
 }else{ [Windows.Forms.Clipboard]::Clear() }`, v);
+// A 32-byte secret that never leaves this PC. On Windows it is kept encrypted by Windows itself (DPAPI, your
+// account on this PC only), in Keyturn's local folder, which OneDrive does not sync.
+async function pcSecret(file, create) {
+  const win = process.platform === 'win32';
+  if (fs.existsSync(file)) {
+    const stored = fs.readFileSync(file, 'utf8').trim();
+    if (!win) return Buffer.from(stored, 'base64');
+    const out = await ps(`${UTF8}Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); [Console]::Out.Write([Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser')))`, stored);
+    const s = Buffer.from(out.trim(), 'base64');
+    if (s.length !== 32) throw new Error('This PC’s Keyturn secret is damaged');
+    return s;
+  }
+  if (!create) return null;
+  const s = require('crypto').randomBytes(32);
+  const stored = win
+    ? (await ps(`${UTF8}Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); [Console]::Out.Write([Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser')))`, s.toString('base64'))).trim()
+    : s.toString('base64');
+  fs.writeFileSync(file, stored, { mode: 0o600 });
+  return s;
+}
+
 const getClipboard = () => ps(`${UTF8}$c=Get-Clipboard -Raw; if($c){[Console]::Out.Write($c)}`, '');
 
-module.exports = { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard };
+module.exports = { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret };

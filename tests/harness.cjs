@@ -230,16 +230,32 @@ async function ownerUnlock(relay, token, phone) {
 }
 
 // What anyone holding a copy of keyturn.json can do with a phone's PRF output (or a recovery code).
-function kFromPrf(cfgText, phone) {
+// v2 phone boxes also need this PC's secret: pass the instance's local folder only to act as the owner on this PC.
+function pcSecretOf(local) {
+  const f = path.join(local, 'pc.secret');
+  if (!fs.existsSync(f)) return null;
+  const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    "Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String((Get-Content -Raw -LiteralPath $env:KT_F).Trim()); [Console]::Out.Write([Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser')))"],
+  { encoding: 'utf8', env: { ...process.env, KT_F: f } });
+  return Buffer.from(out.trim(), 'base64');
+}
+function kFromPrf(cfgText, phone, local) {
   const cfg = JSON.parse(cfgText);
   const d = cfg.devices.find((x) => x.cred === phone.cred);
   if (!d) return null;
-  try { return K.aesUnwrap(K.prfWrapKey(phone.prf, cfg.vaultId), d.box, b64u.dec(phone.cred)); } catch { return null; }
+  try {
+    if (d.v === 2) { const pcs = local && pcSecretOf(local); if (!pcs) return null; return K.openWith(K.phoneKey(phone.prf, pcs, cfg.vaultId), d.box, b64u.dec(phone.cred)); }
+    return K.aesUnwrap(K.prfWrapKey(phone.prf, cfg.vaultId), d.box, b64u.dec(phone.cred));
+  } catch { return null; }
 }
 async function kFromRecovery(cfgText, code) {
   const cfg = JSON.parse(cfgText);
-  if (!cfg.recovery) return null;
-  try { return K.aesUnwrap(await K.recoveryWrapKey(code, b64u.dec(cfg.recovery.salt)), cfg.recovery.box, Buffer.from('recovery')); } catch { return null; }
+  const rec = cfg.recovery;
+  if (!rec) return null;
+  try {
+    if (rec.v === 2) return K.openWith(await K.recoveryKey(code, b64u.dec(rec.salt)), rec.box, Buffer.from('recovery'));
+    return K.aesUnwrap(await K.recoveryWrapKey(code, b64u.dec(rec.salt)), rec.box, Buffer.from('recovery'));
+  } catch { return null; }
 }
 async function openVaultFile(file, key) {
   const { Vault } = require(path.join(APP, 'lib', 'vault.js'));

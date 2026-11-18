@@ -72,7 +72,47 @@ function linkCode(channel, msg) {
   return String(h.readUInt32BE(0) % 10000).padStart(4, '0').replace(/(\d\d)(\d\d)/, '$1 $2');
 }
 
+// ---------- v2 key boxes ----------
+// The vault key K is sealed to a P-256 public key (one per phone, one for the paper code). Sealing needs only
+// the public key, so Keyturn can change K and seal the new one again for every phone and the paper code without
+// asking for them. That is what makes "unlink a phone" and "new paper code" real: old copies of keyturn.json
+// open only old copies of the vault.
+function p256From(seed, label) {
+  for (let i = 0; i < 16; i++) {
+    const d = Buffer.from(crypto.hkdfSync('sha256', seed, Buffer.from(label), Buffer.from('keyturn p256 v2 ' + i), 32));
+    const e = crypto.createECDH('prime256v1');
+    try { e.setPrivateKey(d); return e; } catch { /* outside the curve's range (vanishingly rare): next one */ } finally { d.fill(0); }
+  }
+  throw new Error('Could not make a key');
+}
+const pubOf = (e) => b64u.enc(e.getPublicKey(null, 'uncompressed'));
+function sealKey(shared, epub, pub) {
+  return Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.concat([epub, pub]), Buffer.from('keyturn seal v2'), 32));
+}
+function sealTo(pubB64, plain, aad) {
+  const pub = b64u.dec(pubB64);
+  const eph = crypto.createECDH('prime256v1');
+  eph.generateKeys();
+  const epub = eph.getPublicKey(null, 'uncompressed');
+  const key = sealKey(eph.computeSecret(pub), epub, pub);
+  try { return { epub: b64u.enc(epub), ...aesWrap(key, plain, aad) }; } finally { key.fill(0); }
+}
+function openWith(e, box, aad) {
+  const epub = b64u.dec(String(box.epub));
+  const key = sealKey(e.computeSecret(epub), epub, e.getPublicKey(null, 'uncompressed'));
+  try { return aesUnwrap(key, box, aad); } finally { key.fill(0); }
+}
+// A phone's key pair comes from its passkey secret AND a secret kept only on this PC (pcSecret), so a phished
+// passkey answer plus copies of the vault files is not enough on its own.
+function phoneKey(prf, pcSecret, vaultId) { return p256From(Buffer.concat([prf, pcSecret]), 'phone:' + vaultId); }
+// The paper code's key pair comes from the code alone, so the paper code works on any PC.
+async function recoveryKey(code, salt) {
+  const seed = await recoveryWrapKey(code, salt);
+  try { return p256From(seed, 'recovery'); } finally { seed.fill(0); }
+}
+
 function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
 function token() { return b64u.enc(random(24)); }
+function same(a, b) { return a.length === b.length && crypto.timingSafeEqual(a, b); }
 
-module.exports = { b64u, random, aesWrap, aesUnwrap, prfWrapKey, newRecoveryCode, normaliseCode, recoveryWrapKey, newChannel, openFromPhone, linkCode, sha256, token };
+module.exports = { b64u, random, aesWrap, aesUnwrap, prfWrapKey, newRecoveryCode, normaliseCode, recoveryWrapKey, newChannel, openFromPhone, linkCode, sealTo, openWith, pubOf, phoneKey, recoveryKey, sha256, token, same };

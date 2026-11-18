@@ -270,7 +270,7 @@ const TESTS = [
       const v = await openVault('f6', relay);
       await req('POST', '/api/lock', { token: v.token });
       const kdbxweb = require(path.join(H.APP, 'node_modules', 'kdbxweb'));
-      const key = H.kFromPrf(fs.readFileSync(v.cfgFile, 'utf8'), v.owner);
+      const key = H.kFromPrf(fs.readFileSync(v.cfgFile, 'utf8'), v.owner, v.inst.local);
       const vault = await H.openVaultFile(v.vaultFile, key);
       const T = kdbxweb.VarDictionary.ValueType;
       vault.db.header.kdfParameters.set('M', T.UInt64, kdbxweb.Int64.from(64 * 1024 * 1024));
@@ -311,7 +311,7 @@ const TESTS = [
       const f = path.join(v.src, 'new.txt'); fs.writeFileSync(f, 'sk-attacker-chosen-value');
       const r = await req('POST', '/api/cli/add', { cli: v.cli, body: { group: 'AI', title: 'OpenAI', source: f } });
       await req('POST', '/api/lock', { token: v.token });
-      const key = H.kFromPrf(fs.readFileSync(v.cfgFile, 'utf8'), v.owner);
+      const key = H.kFromPrf(fs.readFileSync(v.cfgFile, 'utf8'), v.owner, v.inst.local);
       const vault = await H.openVaultFile(v.vaultFile, key);
       const e = vault.find('AI/OpenAI').entry;
       const hist = e.history.map((h) => { const p = h.fields.get('Password'); return p && (p.getText ? p.getText() : String(p)); });

@@ -70,6 +70,13 @@
   }
 
   function vWelcome() {
+    if (S.vaultOnly) return `<section class="locked center fade">
+      ${emblem()}
+      <p class="eyebrow">Your vault is here</p>
+      <h1>Open it with your recovery code</h1>
+      <p class="lead">Keyturn’s settings file is missing, but your vault is safe. Type your recovery code to open it, then link your phone again.</p>
+      <button class="btn primary lg" data-act="recovery">${I.shield} Use my recovery code</button>
+    </section>`;
     return `<section class="welcome center fade">
       <div>
         <p class="eyebrow">Welcome</p>
@@ -190,7 +197,11 @@
             <button class="btn ghost sm" data-act="addphone">${I.phone} Link another phone</button></div>
           <div class="panel"><h2>Stay open for</h2>
             <div class="seg" id="seg">${[5, 15, 30, 60].map((m) => `<button data-min="${m}">${m} min</button>`).join('')}</div>
-            <p class="sub">Each unlock lasts this long. <button class="link" data-act="newrecovery">Make a new recovery code</button></p></div>
+            <p class="sub">Each unlock lasts this long.</p></div>
+          <div class="panel"><h2>Recovery code</h2>
+            ${S.paperCheck ? `<div class="alert info">${I.shield}<div><b>One last step for the security update.</b> Type your recovery code once, so it also opens your vault from the vault file alone.</div></div>
+            <button class="btn primary sm" data-act="papercheck">Type my recovery code</button>`
+            : `<p class="sub">Your paper backup if you lose your phone. <button class="link" data-act="papercheck">Check my recovery code</button> · <button class="link" data-act="newrecovery">Make a new one</button></p>`}</div>
         </aside>
       </div>
     </section>`;
@@ -215,7 +226,7 @@
       list.innerHTML = [...groups].map(([g, es]) => `<div class="group"><div class="group-h">${esc(g || 'Other')} <span>· ${es.length}</span></div>${es.map(entryRow).join('')}</div>`).join('');
     }
     $('feed').innerHTML = S.log.length ? S.log.map(feedRow).join('') : '<li><span class="what" style="grid-column:1/-1;color:var(--faint)">Nothing yet.</span></li>';
-    $('devices').innerHTML = S.devices.map((d) => `<li>${I.phone}<div class="dn"><b>${esc(d.name)}</b><small>Linked ${ago(d.created)} · used ${ago(d.lastUsed)}</small></div>
+    $('devices').innerHTML = S.devices.map((d) => `<li>${I.phone}<div class="dn"><b>${esc(d.name)}</b><small>${d.upgraded ? `Linked ${ago(d.created)} · used ${ago(d.lastUsed)}` : 'Unlock once with this phone to finish its update'}</small></div>
       <button class="icon-btn" title="Unlink ${esc(d.name)}" data-act="unlink" data-id="${esc(d.id)}" data-name="${esc(d.name)}">${I.x}</button></li>`).join('');
     for (const b of $('seg').children) b.classList.toggle('on', +b.dataset.min === S.minutes);
   }
@@ -243,7 +254,7 @@
     const pill = $('pill');
     pill.className = 'pill ' + (S.locked ? 'is-locked' : 'is-open');
     pill.textContent = !S.setup ? 'Not set up' : S.locked ? 'Locked' : 'Open';
-    const name = S.recovery ? 'recovery' : S.pending ? 'pair:' + S.pending.status + ':' + (S.pending.error || '') + ':' + S.pending.expiresAt : !S.setup ? 'welcome' : S.locked ? 'locked:' + !!S.request : 'open';
+    const name = S.recovery ? 'recovery' : S.pending ? 'pair:' + S.pending.status + ':' + (S.pending.error || '') + ':' + S.pending.expiresAt : !S.setup ? 'welcome:' + !!S.vaultOnly : S.locked ? 'locked:' + !!S.request : 'open:' + !!S.paperCheck;
     if (name !== current) {
       const kind = name.split(':')[0];
       view.innerHTML = { recovery: vRecovery, pair: vPair, welcome: vWelcome, locked: vLocked, open: vOpen }[kind]();
@@ -251,14 +262,14 @@
       if (kind === 'open') { const q = $('q'); q.value = query; q.oninput = () => { query = q.value; fillOpen(); }; }
       if (kind === 'recovery') $('saved').onchange = (ev) => { $('ackBtn').disabled = !ev.target.checked; };
     }
-    if (current === 'open') fillOpen();
+    if (current.startsWith('open')) fillOpen();
     tick();
   }
 
   function tick() {
     if (!S) return;
     for (const el of document.querySelectorAll('[data-until]')) el.textContent = mmss(+el.dataset.until - Date.now());
-    if (current === 'open' && S.expiresAt) {
+    if (current.startsWith('open') && S.expiresAt) {
       const left = S.expiresAt - Date.now();
       const el = $('left'); if (el) el.textContent = mmss(left);
       const total = S.minutes * 60000;
@@ -270,22 +281,23 @@
   setInterval(tick, 1000);
 
   // ---------- dialogs ----------
-  function recoveryDialog() {
+  function recoveryDialog(check) {
     const d = $('dlg');
-    d.innerHTML = `<form method="dialog"><h2>Use your recovery code</h2><p>Type the 24-character code you saved when you set up Keyturn.</p>
+    d.innerHTML = `<form method="dialog"><h2>${check ? 'Check your recovery code' : 'Use your recovery code'}</h2><p>${check ? 'Type the 24-character code from your paper. Keyturn checks it opens this vault.' : 'Type the 24-character code you saved when you set up Keyturn.'}</p>
       <input class="codein" id="codein" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" maxlength="29">
       <div class="err" id="codeErr"></div>
-      <div class="row"><button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn primary" id="codeGo" value="go">Unlock</button></div></form>`;
+      <div class="row"><button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn primary" id="codeGo" value="go">${check ? 'Check' : 'Unlock'}</button></div></form>`;
     const input = $('codein');
     input.oninput = () => {
       const raw = input.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 24);
       input.value = raw.match(/.{1,4}/g)?.join('-') || '';
     };
+    input.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); $('codeGo').click(); } }; // Enter = the main button, not Cancel
     d.querySelector('form').onsubmit = async (ev) => {
       if (ev.submitter && ev.submitter.value === 'cancel') return;
       ev.preventDefault();
       $('codeGo').disabled = true; $('codeErr').textContent = 'Checking…';
-      try { await act('/api/recovery/unlock', { code: input.value }); d.close(); toast('Unlocked with your recovery code'); }
+      try { await act(check ? '/api/recovery/check' : '/api/recovery/unlock', { code: input.value }); d.close(); toast(check ? 'Your recovery code works' : 'Unlocked with your recovery code'); }
       catch (e) { $('codeErr').textContent = e.message; $('codeGo').disabled = false; }
     };
     d.showModal();
@@ -313,13 +325,14 @@
     else if (a === 'lock') run('/api/lock', null, 'Locked');
     else if (a === 'extend') run('/api/extend', null, '15 more minutes');
     else if (a === 'dismiss') run('/api/dismiss-request');
-    else if (a === 'recovery') recoveryDialog();
+    else if (a === 'recovery') recoveryDialog(false);
+    else if (a === 'papercheck') recoveryDialog(true);
     else if (a === 'print') window.print();
     else if (a === 'ack') run('/api/recovery/ack', null, 'You’re all set');
     else if (a === 'confirmlink') run('/api/link/confirm', null, 'Phone linked');
     else if (a === 'copy') run('/api/copy', { ref: b.dataset.ref }, 'Copied. Clears from the clipboard in 30 seconds');
-    else if (a === 'newrecovery') confirmDialog('Make a new recovery code?', 'Your old code will stop working straight away.', 'Make new code', () => run('/api/recovery/new'));
-    else if (a === 'unlink') confirmDialog(`Unlink ${b.dataset.name}?`, 'That phone will no longer open your keys. You can link it again later.', 'Unlink', () => run('/api/device/remove', { id: b.dataset.id }, 'Phone unlinked'));
+    else if (a === 'newrecovery') confirmDialog('Make a new recovery code?', 'Your old code stops working straight away, even with old backups. Keyturn shows the new one once, so have paper ready.', 'Make new code', () => run('/api/recovery/new'));
+    else if (a === 'unlink') confirmDialog(`Unlink ${b.dataset.name}?`, 'That phone will no longer open your keys, even from old backups. Your other phones keep working, and you can link it again later.', 'Unlink', () => run('/api/device/remove', { id: b.dataset.id }, 'Phone unlinked'));
   });
 
   function connect() {
