@@ -10,7 +10,7 @@ const { spawn } = require('child_process');
 const QRCode = require('qrcode');
 const K = require('./lib/kcrypto');
 const { Vault } = require('./lib/vault');
-const { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret } = require('./lib/system');
+const { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret, recycle } = require('./lib/system');
 
 const PORT = +process.env.KEYTURN_PORT || 7457;
 const RELAY = (process.env.KEYTURN_RELAY || 'https://keys.aiforge.uk').replace(/\/$/, '');
@@ -586,6 +586,24 @@ async function cli(req, cmd, b) {
       const r = await session.vault.upsert({ group: b.group, title: b.title, value: src.value, file: src.file, source: src.label });
       await saveVault('assistant', r.created ? 'Saved' : 'Updated', [r.ref]);
       return r;
+    }
+    case 'take': {
+      // Save a loose file (a downloaded key, a recovery-codes .txt) into the vault, then move the original to the
+      // Recycle Bin. Only after the vault is saved. Files that programs read in place (.env, SSH keys) are refused.
+      needOpen();
+      if (!b.group || !b.title || !b.file) throw httpErr(400, 'group, title and file needed');
+      const file = path.resolve(String(b.file));
+      const base = path.basename(file).toLowerCase();
+      const inSsh = file.toLowerCase().includes(`${path.sep}.ssh${path.sep}`);
+      if (/^\.env(\.|$)/.test(base) || inSsh) throw httpErr(400, 'Programs read this file in place. Use add (keeps the file) instead of take.');
+      for (const d of [DATA, LOCAL]) if (file.toLowerCase().startsWith(path.resolve(d).toLowerCase() + path.sep)) throw httpErr(400, "Not inside Keyturn's own folders");
+      const src = await readSource(file);
+      if (!src || !src.file) throw httpErr(404, 'File not found');
+      const r = await session.vault.upsert({ group: b.group, title: b.title, value: src.value, file: src.file, source: src.label });
+      await saveVault('assistant', r.created ? 'Saved' : 'Updated', [r.ref]);
+      await recycle(file);
+      log('assistant', 'Moved the original to the Recycle Bin', [path.basename(file)]);
+      return { ...r, recycled: file };
     }
     case 'move': needOpen(); if (!session.vault.move(b.ref, b.group)) throw httpErr(404, 'Not found'); await saveVault('assistant', `Moved to ${b.group}`, [b.ref]); return { ok: true };
     case 'rename': needOpen(); if (!session.vault.rename(b.ref, b.title)) throw httpErr(404, 'Not found'); await saveVault('assistant', `Renamed to “${b.title}”`, [b.ref]); return { ok: true };

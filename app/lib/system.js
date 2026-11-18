@@ -112,6 +112,12 @@ const setClipboard = (v) => ps(`${UTF8}Add-Type -AssemblyName System.Windows.For
   foreach($f in 'ExcludeClipboardContentFromMonitorProcessing','CanIncludeInClipboardHistory','CanUploadToCloudClipboard'){ $d.SetData($f, (New-Object IO.MemoryStream(,[byte[]](0,0,0,0)))) }
   [Windows.Forms.Clipboard]::SetDataObject($d, $true, 10, 50)
 }else{ [Windows.Forms.Clipboard]::Clear() }`, v);
+// Move a file to the Recycle Bin (recoverable), never a hard delete.
+async function recycle(file) {
+  if (process.platform !== 'win32') { const bin = path.join(os.homedir(), '.Trash'); fs.mkdirSync(bin, { recursive: true }); fs.renameSync(file, path.join(bin, path.basename(file))); return; }
+  await ps(`${UTF8}Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:KT_FILE, 'OnlyErrorDialogs', 'SendToRecycleBin')`, '', { KT_FILE: file });
+}
+
 // A 32-byte secret that never leaves this PC. On Windows it is kept encrypted by Windows itself (DPAPI, your
 // account on this PC only), in Keyturn's local folder, which OneDrive does not sync.
 async function pcSecret(file, create) {
@@ -135,4 +141,4 @@ async function pcSecret(file, create) {
 
 const getClipboard = () => ps(`${UTF8}$c=Get-Clipboard -Raw; if($c){[Console]::Out.Write($c)}`, '');
 
-module.exports = { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret };
+module.exports = { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret, recycle };

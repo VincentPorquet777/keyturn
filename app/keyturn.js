@@ -14,6 +14,7 @@ const HELP = `keyturn <command>
   dupes                          keys holding the same value
   import <manifest.json>         save many keys ([{group,title,source}])
   add <group> <title> <source>   save one key (source: path, env:NAME or dpapi:path)
+  take <group> <title> <file>    save a loose file (e.g. a download) and move the original to the Recycle Bin
   move <group/title> <group>     rename <group/title> <new title>     remove <group/title>
   wire <group/title> <NAME> [--dotenv <file>]   put a key into a Windows setting or a .env file
   lock                           lock now`;
@@ -86,6 +87,7 @@ const left = (t) => { const m = Math.max(0, Math.round((t - Date.now()) / 60000)
       for (const f of r.failed) console.log(`  failed: ${f.ref} (${f.why})`);
       break;
     }
+    case 'take': { if (a.length < 3) fail(HELP); const r = await call('take', { group: a[0], title: a[1], file: path.resolve(a[2]) }); console.log(`${r.created ? 'Saved' : 'Updated'} ${r.ref}; original moved to the Recycle Bin`); break; }
     case 'add': { if (a.length < 3) fail(HELP); const r = await call('add', { group: a[0], title: a[1], source: a[2] }); console.log(`${r.created ? 'Saved' : 'Updated'} ${r.ref}`); break; }
     case 'move': { await call('move', { ref: a[0], group: a[1] }); console.log('Moved'); break; }
     case 'rename': { await call('rename', { ref: a[0], title: a[1] }); console.log('Renamed'); break; }
