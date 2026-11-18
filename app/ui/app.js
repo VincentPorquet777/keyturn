@@ -1,6 +1,6 @@
 (() => {
   'use strict';
-  const TOKEN = document.querySelector('meta[name="kt-token"]').content;
+  let TOKEN = null; // window key, traded once for this window's one-time link (#k=...) and kept for reloads
   const $ = (id) => document.getElementById(id);
   const view = $('view');
   let S = null;
@@ -87,9 +87,21 @@
     </section>`;
   }
 
+  function vConfirm(p, title) {
+    return `<section class="recovery center fade">
+      <div class="badge">${I.phone}</div>
+      <p class="eyebrow">${esc(title)}</p>
+      <h1>Does your phone show this code?</h1>
+      <div class="code">${String(p.code).split(' ').map((g) => `<span>${esc(g)}</span>`).join('')}</div>
+      <p class="lead">Only say yes if your phone shows exactly the same code. If it doesn’t, someone else may have scanned your QR code: choose No and start again.</p>
+      <div class="row" style="justify-content:center"><button class="btn ghost" data-act="cancel">No, cancel</button><button class="btn primary" data-act="confirmlink">Yes, it matches</button></div>
+    </section>`;
+  }
+
   function vPair() {
     const p = S.pending;
     const unlock = p.kind === 'unlock';
+    if (p.status === 'confirm') return vConfirm(p, { enroll: 'Link your phone', addphone: 'Link another phone' }[p.kind]);
     const order = ['connecting', 'waiting', 'phone', 'verifying', 'done'];
     const at = order.indexOf(p.status);
     const step = (n) => (at < 0 ? '' : n === 1 ? (at >= 2 ? 'done' : 'now') : n === 2 ? (at >= 4 ? 'done' : at >= 2 ? 'now' : '') : at >= 4 ? 'done' : '');
@@ -108,7 +120,7 @@
         ${p.error ? `<div class="alert err">${I.alert}<div>${esc(p.error)}</div></div>` : ''}
         <ol class="live">
           <li class="${step(1)}"><span class="ic">${step(1) === 'done' ? '✓' : '1'}</span><b>Scan the code</b><small>Your phone opens keys.aiforge.uk</small></li>
-          <li class="${step(2)}"><span class="ic">${step(2) === 'done' ? '✓' : '2'}</span><b>${unlock ? 'Touch your fingerprint' : 'Create your passkey'}</b><small>Check your phone shows <code>${esc(p.code)}</code></small></li>
+          <li class="${step(2)}"><span class="ic">${step(2) === 'done' ? '✓' : '2'}</span><b>${unlock ? 'Touch your fingerprint' : 'Create your passkey'}</b><small>${unlock ? `Check your phone shows <code>${esc(p.code)}</code>` : 'Your phone shows a code; you’ll check it here next'}</small></li>
           <li class="${step(3)}"><span class="ic">${step(3) === 'done' ? '✓' : '3'}</span><b>${unlock ? `Open for ${S.minutes} minutes` : 'Linked'}</b><small>${unlock ? 'Then it locks itself' : 'Next: your recovery code'}</small></li>
         </ol>
         <div class="row">
@@ -304,6 +316,7 @@
     else if (a === 'recovery') recoveryDialog();
     else if (a === 'print') window.print();
     else if (a === 'ack') run('/api/recovery/ack', null, 'You’re all set');
+    else if (a === 'confirmlink') run('/api/link/confirm', null, 'Phone linked');
     else if (a === 'copy') run('/api/copy', { ref: b.dataset.ref }, 'Copied. Clears from the clipboard in 30 seconds');
     else if (a === 'newrecovery') confirmDialog('Make a new recovery code?', 'Your old code will stop working straight away.', 'Make new code', () => run('/api/recovery/new'));
     else if (a === 'unlink') confirmDialog(`Unlink ${b.dataset.name}?`, 'That phone will no longer open your keys. You can link it again later.', 'Unlink', () => run('/api/device/remove', { id: b.dataset.id }, 'Phone unlinked'));
@@ -312,7 +325,30 @@
   function connect() {
     const es = new EventSource(`/api/events?t=${encodeURIComponent(TOKEN)}`);
     es.onmessage = (m) => { S = JSON.parse(m.data); render(); };
-    es.onerror = () => { es.close(); setTimeout(connect, 1500); };
+    es.onerror = async () => {
+      es.close();
+      const r = await fetch('/api/ping', { headers: { 'x-keyturn-ui': TOKEN } }).catch(() => null);
+      if (r && r.status === 401) { try { sessionStorage.removeItem('kt'); } catch { /* ignore */ } return shut('Keyturn closed this window. Open Keyturn again from its icon.'); }
+      setTimeout(connect, 1500);
+    };
   }
-  connect();
+  async function windowKey() {
+    const m = location.hash.match(/^#k=([A-Za-z0-9_-]+)$/);
+    if (m) {
+      history.replaceState(null, '', location.pathname);
+      const r = await fetch('/api/hello', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ k: m[1] }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || 'This window could not connect. Open Keyturn again from its icon.');
+      try { sessionStorage.setItem('kt', j.token); } catch { /* ignore */ }
+      return j.token;
+    }
+    let t = null;
+    try { t = sessionStorage.getItem('kt'); } catch { /* ignore */ }
+    if (t) return t;
+    throw new Error('Open Keyturn from its desktop icon.');
+  }
+  function shut(msg) {
+    view.innerHTML = `<section class="locked center fade">${emblem()}<p class="eyebrow">Keyturn</p><h1>This window isn’t connected</h1><p class="lead">${esc(msg)}</p></section>`;
+  }
+  windowKey().then((t) => { TOKEN = t; connect(); }).catch((e) => shut(e.message));
 })();

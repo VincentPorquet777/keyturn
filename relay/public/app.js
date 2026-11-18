@@ -57,15 +57,29 @@
 
   class KtError extends Error { constructor(code, msg) { super(msg || code); this.code = code; } }
 
-  async function seal(p, payload) {
+  // One key exchange per scanned code. When linking a phone, the match code comes from it, and the PC shows
+  // that code only after this phone has answered: someone who merely saw the QR code can't produce the same one.
+  async function prepare(p) {
+    if (p.shared) return;
     const pcKey = await crypto.subtle.importKey('raw', b64u.dec(p.pub), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
-    const eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
-    const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: pcKey }, eph.privateKey, 256);
-    const hk = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+    p.eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+    p.shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: pcKey }, p.eph.privateKey, 256);
+  }
+
+  async function linkCode(p) {
+    await prepare(p);
+    const hk = await crypto.subtle.importKey('raw', p.shared, 'HKDF', false, ['deriveBits']);
+    const v = new DataView(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: te.encode(p.ch), info: te.encode('keyturn match v2') }, hk, 32));
+    return String(v.getUint32(0) % 10000).padStart(4, '0').replace(/(\d\d)(\d\d)/, '$1 $2');
+  }
+
+  async function seal(p, payload) {
+    await prepare(p);
+    const hk = await crypto.subtle.importKey('raw', p.shared, 'HKDF', false, ['deriveKey']);
     const key = await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: te.encode(p.ch), info: te.encode('keyturn channel v1') }, hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
     const iv = rand(12);
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(p.ch) }, key, te.encode(JSON.stringify(payload)));
-    return { pub: b64u.enc(await crypto.subtle.exportKey('raw', eph.publicKey)), iv: b64u.enc(iv), ct: b64u.enc(ct) };
+    return { pub: b64u.enc(await crypto.subtle.exportKey('raw', p.eph.publicKey)), iv: b64u.enc(iv), ct: b64u.enc(ct) };
   }
 
   async function send(p, payload, workingTitle) {
@@ -151,7 +165,8 @@
   }
 
   async function finishEnroll(p, rawId, first) {
-    await send(p, { t: 'enroll', cred: b64u.enc(rawId), prf: b64u.enc(first), device: deviceName() }, 'Linking to your PC…');
+    const j = await send(p, { t: 'enroll', cred: b64u.enc(rawId), prf: b64u.enc(first), device: deviceName() }, 'Linking to your PC…');
+    if (j.detail === 'confirm') return done('Now check your PC', `If <b>${esc(p.name)}</b> shows <b>${esc(p.code)}</b>, click <b>Yes, it matches</b> there. If it shows a different code, click <b>No</b>.`);
     done('This phone is your key', `Finish on <b>${esc(p.name)}</b>: it’s showing your recovery code.`);
   }
 
@@ -186,7 +201,8 @@
 
   async function start(p) {
     current = p;
-    const code = await matchCode(p);
+    const code = p.mode === 'u' ? await matchCode(p) : await linkCode(p);
+    p.code = code;
     $('matchCode').textContent = code;
     $('match').hidden = false;
     fetch(`/api/ch/${p.ch}/hello`, { method: 'POST' }).then((r) => { if (r.status === 410) fail(new KtError('expired')); }).catch(() => {});

@@ -113,6 +113,7 @@ class Vault {
     const g = this.group(group, true);
     let found = this.find(group + '/' + title);
     const entry = found ? found.entry : this.db.createEntry(g);
+    if (found) entry.pushHistory(); // an overwritten value stays recoverable in KeePass history
     entry.fields.set('Title', title);
     if (value != null) entry.fields.set('Password', kdbxweb.ProtectedValue.fromString(String(value)));
     if (source) entry.fields.set(SOURCE, source);

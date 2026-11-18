@@ -22,7 +22,8 @@ function aesWrap(key, plain, aad) {
 function aesUnwrap(key, box, aad) {
   const iv = b64u.dec(box.iv);
   const all = b64u.dec(box.ct);
-  const d = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  if (iv.length !== 12 || all.length < 16) throw new Error('Bad box');
+  const d = crypto.createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
   if (aad) d.setAAD(aad);
   d.setAuthTag(all.subarray(all.length - 16));
   return Buffer.concat([d.update(all.subarray(0, all.length - 16)), d.final()]);
@@ -56,13 +57,22 @@ function newChannel() {
   return { id: b64u.enc(random(16)), ecdh, pub: b64u.enc(ecdh.getPublicKey(null, 'uncompressed')) };
 }
 function openFromPhone(channel, msg) {
-  const shared = channel.ecdh.computeSecret(b64u.dec(msg.pub));
+  const shared = channel.ecdh.computeSecret(b64u.dec(String(msg.pub)));
   const key = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.from(channel.id), Buffer.from('keyturn channel v1'), 32));
   const plain = aesUnwrap(key, { iv: msg.iv, ct: msg.ct }, Buffer.from(channel.id));
   return JSON.parse(plain.toString('utf8'));
 }
 
+// Match code for linking a phone. It comes from the key exchange with the phone that actually answered,
+// so someone who only saw the QR code cannot predict or copy the code the owner's own phone shows.
+// (Same derivation as linkCode() in relay/public/app.js.)
+function linkCode(channel, msg) {
+  const shared = channel.ecdh.computeSecret(b64u.dec(String(msg.pub)));
+  const h = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.from(channel.id), Buffer.from('keyturn match v2'), 4));
+  return String(h.readUInt32BE(0) % 10000).padStart(4, '0').replace(/(\d\d)(\d\d)/, '$1 $2');
+}
+
 function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
 function token() { return b64u.enc(random(24)); }
 
-module.exports = { b64u, random, aesWrap, aesUnwrap, prfWrapKey, newRecoveryCode, normaliseCode, recoveryWrapKey, newChannel, openFromPhone, sha256, token };
+module.exports = { b64u, random, aesWrap, aesUnwrap, prfWrapKey, newRecoveryCode, normaliseCode, recoveryWrapKey, newChannel, openFromPhone, linkCode, sha256, token };

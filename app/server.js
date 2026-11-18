@@ -10,7 +10,7 @@ const { spawn } = require('child_process');
 const QRCode = require('qrcode');
 const K = require('./lib/kcrypto');
 const { Vault } = require('./lib/vault');
-const { readSource, setUserEnv, writeDotenv, setClipboard, getClipboard } = require('./lib/system');
+const { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard } = require('./lib/system');
 
 const PORT = +process.env.KEYTURN_PORT || 7457;
 const RELAY = (process.env.KEYTURN_RELAY || 'https://keys.aiforge.uk').replace(/\/$/, '');
@@ -26,9 +26,14 @@ const CHANNEL_MS = 3 * 60 * 1000;
 fs.mkdirSync(DATA, { recursive: true });
 fs.mkdirSync(LOCAL, { recursive: true });
 
-const uiToken = K.token();
-const cliToken = K.token();
-fs.writeFileSync(path.join(LOCAL, 'cli.token'), cliToken);
+// The window's key is never put inside a page. Each window Keyturn opens gets a one-time link (#k=...) that it
+// trades for the key once. A second use of the same link means another program got there first.
+let uiToken = K.token();
+const cliToken = K.token(); // written to cli.token only once this copy is the one listening
+const launches = new Map(); // one-time window links: code -> expiry
+const usedLaunches = new Set();
+let copied = null;          // fingerprint of the value Keyturn last put on the clipboard
+const EXISTING_VAULT = `There is already a vault in ${DATA}, but its settings file (keyturn.json) is missing or damaged. Keyturn won’t replace your vault. Put keyturn.json back (keyturn.json.bak is the previous copy) and open Keyturn again.`;
 
 let cfg = loadCfg();
 let session = null;      // { K, vault, expiresAt, timer }
@@ -40,11 +45,12 @@ const sseClients = new Set();
 const sessionLog = [];
 
 function loadCfg() { try { return JSON.parse(fs.readFileSync(CFG, 'utf8')); } catch { return null; } }
-function saveCfg() {
+function saveCfg(scrub) {
   const tmp = CFG + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
   if (fs.existsSync(CFG)) fs.copyFileSync(CFG, CFG + '.bak');
   fs.renameSync(tmp, CFG);
+  if (scrub) fs.copyFileSync(CFG, CFG + '.bak'); // the backup must not keep a phone or code that was just revoked
 }
 const minutes = () => (cfg && cfg.minutes) || 15;
 
@@ -72,12 +78,19 @@ function arm() {
   session.timer = setTimeout(() => lock('timer'), Math.max(0, session.expiresAt - Date.now()));
 }
 function lock(reason) {
+  if (pending && pending.kind !== 'unlock') cancelChannel(); // a phone link waiting for you dies with the session
+  clearCopied();
   if (!session) return;
   clearTimeout(session.timer);
   try { cfg.summary = session.vault.summary(); saveCfg(); } catch { /* ignore */ }
   session.K.fill(0);
   session = null;
-  log(reason === 'timer' ? 'system' : reason === 'assistant' ? 'assistant' : 'you', reason === 'timer' ? 'Locked itself (time up)' : 'Locked');
+  log({ timer: 'system', assistant: 'assistant', tamper: 'system' }[reason] || 'you', reason === 'timer' ? 'Locked itself (time up)' : 'Locked');
+}
+function clearCopied() {
+  const h = copied;
+  copied = null;
+  if (h) getClipboard().then((c) => (K.sha256(c.replace(/\r?\n$/, '')) === h ? setClipboard('') : null)).catch(() => { /* ignore */ });
 }
 async function saveVault(who, action, names) {
   await session.vault.save();
@@ -102,7 +115,9 @@ async function startChannel(kind) {
   const name = encodeURIComponent(PC).replace(/\./g, '%2E');
   const url = `${RELAY}/#v1.${mode}.${c.id}.${c.pub}.${K.b64u.enc(salt)}.${name}.${minutes()}`;
   const qr = await QRCode.toString(url, { type: 'svg', errorCorrectionLevel: 'Q', margin: 0, color: { dark: '#0C1016', light: '#0000' } });
-  const p = { kind, channel: c, salt, url, qr, code: matchCode(c.id, c.pub), status: 'connecting', error: null, expiresAt: Date.now() + CHANNEL_MS };
+  // Unlock: the code comes from the QR, so you can compare it before touching the sensor.
+  // Linking a phone: the code comes from the phone that answered, and shows here only after it answers.
+  const p = { kind, channel: c, salt, url, qr, code: kind === 'unlock' ? matchCode(c.id, c.pub) : null, answer: null, status: 'connecting', error: null, expiresAt: Date.now() + CHANNEL_MS };
   pending = p;
   p.timer = setTimeout(() => { if (pending === p) finishChannel(p, 'expired'); }, CHANNEL_MS);
   const ws = new WebSocket(RELAY.replace(/^http/, 'ws') + `/api/ch/${c.id}/ws`);
@@ -115,12 +130,16 @@ async function startChannel(kind) {
     if (pending !== p) return;
     if (msg.type === 'hello') { if (p.status === 'waiting') { p.status = 'phone'; push(); } return; }
     if (msg.type !== 'payload') return;
-    p.status = 'verifying'; push();
+    const link = p.kind !== 'unlock';
     let result;
-    try { result = await handlePhone(p, msg); } catch (e) { result = { ok: false, message: e.expose ? e.message : 'Something went wrong on the PC.' }; if (!e.expose) console.error(e); }
+    if (link && p.answer) result = { ok: false, message: 'Another phone already answered this code. Start again on your PC.' };
+    else {
+      p.status = 'verifying'; push();
+      try { result = link ? takeLink(p, msg) : await handlePhone(p, msg); } catch (e) { result = { ok: false, message: e.expose ? e.message : 'Something went wrong on the PC.' }; if (!e.expose) console.error(e); }
+    }
     try { ws.send(JSON.stringify({ type: 'result', ...result })); } catch { /* ignore */ }
-    if (result.ok) finishChannel(p, 'done');
-    else { p.status = 'phone'; p.error = result.message; push(); }
+    if (result.ok && !link) finishChannel(p, 'done');
+    else if (!result.ok && pending === p && !p.answer) { p.status = 'phone'; p.error = result.message; push(); }
   };
   push();
   return p;
@@ -141,53 +160,82 @@ function cancelChannel() {
   push();
 }
 
-async function handlePhone(p, msg) {
+function readPhone(p, msg) {
   let data;
   try { data = K.openFromPhone(p.channel, msg); } catch { throw httpErr(400, 'That message could not be read.'); }
-  const credId = K.b64u.dec(data.cred || '');
-  const prf = K.b64u.dec(data.prf || '');
-  if (prf.length !== 32 || !credId.length) throw httpErr(400, 'Your phone sent an incomplete answer.');
+  if (K.b64u.dec(data.prf || '').length !== 32 || !K.b64u.dec(data.cred || '').length) throw httpErr(400, 'Your phone sent an incomplete answer.');
+  return data;
+}
 
-  if (p.kind === 'enroll' && !cfg) {
-    if (data.t !== 'enroll') throw httpErr(400, 'Wrong step.');
-    const key = K.random(32);
-    const vaultId = K.b64u.enc(K.random(16));
-    const vault = await Vault.create(VAULT, key, 'Keyturn');
-    const code = K.newRecoveryCode();
-    const rsalt = K.random(16);
-    cfg = {
-      v: 1, product: 'Keyturn', vaultId, prfSalt: K.b64u.enc(p.salt), relay: RELAY, minutes: 15, created: new Date().toISOString(),
-      devices: [device(data, credId, prf, key, vaultId)],
-      recovery: { salt: K.b64u.enc(rsalt), box: K.aesWrap(await K.recoveryWrapKey(code, rsalt), key, Buffer.from('recovery')) },
-    };
-    saveCfg();
-    startSession(key, vault);
-    freshRecovery = code;
-    log('you', `Linked ${cfg.devices[0].name} and created the vault`);
-    return { ok: true, message: 'Linked', detail: '' };
-  }
-  if (p.kind === 'addphone') {
-    if (!session) throw httpErr(423, 'The vault locked before the phone answered.');
-    if (cfg.devices.some((d) => d.cred === data.cred)) throw httpErr(409, 'This phone is already linked.');
-    const d = device(data, credId, prf, session.K, cfg.vaultId);
-    cfg.devices.push(d);
-    saveCfg();
-    log('you', `Linked another phone: ${d.name}`);
-    return { ok: true, message: 'Linked', detail: '' };
-  }
-  if (p.kind === 'unlock') {
-    if (data.t !== 'unlock') throw httpErr(400, 'Wrong step.');
-    const d = cfg.devices.find((x) => x.cred === data.cred);
-    if (!d) throw httpErr(403, 'This passkey isn’t linked to this PC.');
-    let key;
-    try { key = K.aesUnwrap(K.prfWrapKey(prf, cfg.vaultId), d.box, credId); } catch { throw httpErr(403, 'That key didn’t match.'); }
-    const vault = await Vault.open(VAULT, key);
-    d.lastUsed = new Date().toISOString();
-    startSession(key, vault);
-    log('you', `Unlocked with ${d.name}`);
-    return { ok: true, message: 'Unlocked', detail: `for ${minutes()} minutes` };
-  }
-  throw httpErr(400, 'Unknown request.');
+// Linking a phone: take the first readable answer only, then wait for the owner to confirm the code on the PC.
+function takeLink(p, msg) {
+  const data = readPhone(p, msg);
+  if (data.t !== 'enroll') throw httpErr(400, 'Wrong step.');
+  if (p.kind === 'addphone' && cfg && cfg.devices.some((d) => d.cred === data.cred)) throw httpErr(409, 'This phone is already linked.');
+  p.answer = data;
+  p.code = K.linkCode(p.channel, msg);
+  p.status = 'confirm';
+  p.error = null;
+  push();
+  return { ok: true, message: 'Now check your PC', detail: 'confirm' };
+}
+
+async function confirmLink() {
+  const p = pending;
+  if (!p || p.status !== 'confirm' || !p.answer) throw httpErr(409, 'Nothing to confirm.');
+  const data = p.answer;
+  p.answer = null;
+  const credId = K.b64u.dec(data.cred);
+  const prf = K.b64u.dec(data.prf);
+  try {
+    if (p.kind === 'enroll') {
+      if (cfg) throw httpErr(409, 'Already set up');
+      if (fs.existsSync(VAULT)) throw httpErr(409, EXISTING_VAULT);
+      const key = K.random(32);
+      const vaultId = K.b64u.enc(K.random(16));
+      const vault = await Vault.create(VAULT, key, 'Keyturn');
+      const code = K.newRecoveryCode();
+      const rsalt = K.random(16);
+      cfg = {
+        v: 1, product: 'Keyturn', vaultId, prfSalt: K.b64u.enc(p.salt), relay: RELAY, minutes: 15, created: new Date().toISOString(),
+        devices: [device(data, credId, prf, key, vaultId)],
+        recovery: { salt: K.b64u.enc(rsalt), box: K.aesWrap(await K.recoveryWrapKey(code, rsalt), key, Buffer.from('recovery')) },
+      };
+      saveCfg();
+      startSession(key, vault);
+      freshRecovery = code;
+      log('you', `Linked ${cfg.devices[0].name} and created the vault`);
+    } else {
+      if (!session) throw httpErr(423, 'The vault locked before you confirmed.');
+      if (cfg.devices.some((d) => d.cred === data.cred)) throw httpErr(409, 'This phone is already linked.');
+      const d = device(data, credId, prf, session.K, cfg.vaultId);
+      cfg.devices.push(d);
+      saveCfg();
+      log('you', `Linked another phone: ${d.name}`);
+    }
+  } catch (e) {
+    if (pending === p) cancelChannel();
+    throw e;
+  } finally { prf.fill(0); }
+  finishChannel(p, 'done');
+}
+
+async function handlePhone(p, msg) {
+  const data = readPhone(p, msg);
+  if (data.t !== 'unlock') throw httpErr(400, 'Wrong step.');
+  const credId = K.b64u.dec(data.cred);
+  const prf = K.b64u.dec(data.prf);
+  const d = cfg.devices.find((x) => x.cred === data.cred);
+  if (!d) throw httpErr(403, 'This passkey isn’t linked to this PC.');
+  let key;
+  try { key = K.aesUnwrap(K.prfWrapKey(prf, cfg.vaultId), d.box, credId); } catch { throw httpErr(403, 'That key didn’t match.'); } finally { prf.fill(0); }
+  let vault;
+  try { vault = await Vault.open(VAULT, key); } catch (e) { key.fill(0); throw e; }
+  if (pending !== p) { key.fill(0); throw httpErr(409, 'Cancelled on the PC.'); } // Cancel or Lock was pressed while this was being checked
+  d.lastUsed = new Date().toISOString();
+  startSession(key, vault);
+  log('you', `Unlocked with ${d.name}`);
+  return { ok: true, message: 'Unlocked', detail: `for ${minutes()} minutes` };
 }
 
 function device(data, credId, prf, key, vaultId) {
@@ -255,6 +303,13 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await cli(req, p.slice(9), req.method === 'POST' ? await body(req) : Object.fromEntries(url.searchParams)));
     }
 
+    // A new window trades its one-time link for the window key
+    if (p === '/api/hello' && req.method === 'POST') {
+      const o = req.headers.origin;
+      if (o && o !== `http://127.0.0.1:${PORT}` && o !== `http://localhost:${PORT}`) return send(res, 403, { error: 'Bad origin' });
+      return send(res, 200, hello(String((await body(req)).k || '')));
+    }
+
     // App window
     if (req.headers['x-keyturn-ui'] !== uiToken && !(p === '/api/events' && url.searchParams.get('t') === uiToken)) return send(res, 401, { error: 'Bad token' });
     if (req.method === 'POST') {
@@ -277,9 +332,37 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+function newLaunch() {
+  const now = Date.now();
+  for (const [k, t] of launches) if (t < now) launches.delete(k);
+  const k = K.token();
+  launches.set(k, now + 2 * 60000);
+  return k;
+}
+function hello(k) {
+  const exp = launches.get(k);
+  if (exp && exp > Date.now()) {
+    launches.delete(k);
+    usedLaunches.add(k);
+    if (usedLaunches.size > 50) usedLaunches.delete(usedLaunches.values().next().value);
+    return { token: uiToken };
+  }
+  if (usedLaunches.has(k)) {
+    // Someone used this window's link before the window did: shut every window out and lock.
+    uiToken = K.token();
+    for (const r of sseClients) { try { r.end(); } catch { /* ignore */ } }
+    sseClients.clear();
+    cancelChannel();
+    lock('tamper');
+    log('system', 'Another program on this PC used the Keyturn window’s link first. Keyturn locked itself and closed every window.');
+    throw httpErr(409, 'Another program on this PC used this window’s link first, so Keyturn locked itself to be safe. Close this window and open Keyturn again from its icon.');
+  }
+  throw httpErr(403, 'This window link has expired. Open Keyturn from its desktop icon.');
+}
+
 function serveUi(res, p) {
   if (p === '/' || p === '/index.html') {
-    const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8').replace('__TOKEN__', uiToken);
+    const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8'); // no key in the page: see hello()
     res.writeHead(200, { 'content-type': MIME['.html'], 'cache-control': 'no-store', 'content-security-policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'", 'x-frame-options': 'DENY' });
     return res.end(html);
   }
@@ -291,7 +374,9 @@ function serveUi(res, p) {
 
 async function ui(p, b) {
   switch (p) {
-    case '/api/setup': if (cfg) throw httpErr(409, 'Already set up'); await startChannel('enroll'); return;
+    case '/api/setup': if (cfg) throw httpErr(409, 'Already set up'); if (fs.existsSync(VAULT)) throw httpErr(409, EXISTING_VAULT); await startChannel('enroll'); return;
+    case '/api/link/confirm': await confirmLink(); return;
+    case '/api/ping': return { ok: true };
     case '/api/unlock': await startChannel('unlock'); return;
     case '/api/addphone': await startChannel('addphone'); return;
     case '/api/cancel': cancelChannel(); return;
@@ -316,7 +401,7 @@ async function ui(p, b) {
       const code = K.newRecoveryCode();
       const rsalt = K.random(16);
       cfg.recovery = { salt: K.b64u.enc(rsalt), box: K.aesWrap(await K.recoveryWrapKey(code, rsalt), session.K, Buffer.from('recovery')) };
-      saveCfg();
+      saveCfg(true);
       freshRecovery = code;
       log('you', 'Made a new recovery code (the old one no longer works)');
       return;
@@ -327,7 +412,7 @@ async function ui(p, b) {
       if (!d) throw httpErr(404, 'Not found');
       if (cfg.devices.length === 1 && !cfg.recovery) throw httpErr(409, 'This is your only way in.');
       cfg.devices = cfg.devices.filter((x) => x !== d);
-      saveCfg();
+      saveCfg(true);
       log('you', `Unlinked ${d.name}`);
       return;
     }
@@ -342,7 +427,8 @@ async function ui(p, b) {
       await setClipboard(secret);
       log('you', 'Copied', [b.ref]);
       const h = K.sha256(secret);
-      setTimeout(async () => { try { if (K.sha256((await getClipboard()).replace(/\r?\n$/, '')) === h) await setClipboard(''); } catch { /* ignore */ } }, 30000);
+      copied = h;
+      setTimeout(() => { if (copied === h) clearCopied(); }, 30000); // also cleared on lock
       return { ok: true, clearsIn: 30 };
     }
     default: throw httpErr(404, 'Not found');
@@ -353,7 +439,9 @@ async function ui(p, b) {
 async function cli(req, cmd, b) {
   switch (cmd) {
     case 'status': return { setup: !!cfg, locked: !session, expiresAt: session && session.expiresAt, pending: pending && pending.status, request };
+    case 'window': openWindow(); return { ok: true }; // the desktop icon, clicked while Keyturn is already running
     case 'open': {
+      if (session) return { ok: true, message: 'Already open' };
       request = { reason: String(b.reason || 'Your assistant would like to sort your keys').slice(0, 140), at: new Date().toISOString() };
       if (cfg && !session && !pending) await startChannel('unlock');
       openWindow();
@@ -402,10 +490,11 @@ async function cli(req, cmd, b) {
       needOpen();
       const secret = session.vault.secretOf(b.ref);
       if (secret == null) throw httpErr(404, 'No single value to use for this key');
-      if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(b.name || '')) throw httpErr(400, 'Bad variable name');
+      const keyturnDirs = [DATA, LOCAL];
+      try { checkEnvName(b.name); if (b.dotenv) dotenvTarget(b.dotenv, keyturnDirs); } catch (e) { throw httpErr(400, e.message); }
       let where;
       let label;
-      if (b.dotenv) { await writeDotenv(b.dotenv, b.name, secret); where = `${b.dotenv} (${b.name})`; label = `${path.basename(path.dirname(b.dotenv))}${path.sep}${path.basename(b.dotenv)} (${b.name})`; }
+      if (b.dotenv) { await writeDotenv(b.dotenv, b.name, secret, keyturnDirs); where = `${b.dotenv} (${b.name})`; label = `${path.basename(path.dirname(b.dotenv))}${path.sep}${path.basename(b.dotenv)} (${b.name})`; }
       else { await setUserEnv(b.name, secret); where = `Windows setting ${b.name}`; label = where; }
       session.vault.markUsed(b.ref, where);
       await saveVault('assistant', `Put into ${label}`, [b.ref]);
@@ -416,17 +505,26 @@ async function cli(req, cmd, b) {
 }
 
 function openWindow() {
-  if (process.env.KEYTURN_NO_WINDOW) return;
+  const url = `http://127.0.0.1:${PORT}/#k=${newLaunch()}`;
+  if (process.env.KEYTURN_NO_WINDOW) { console.log(`Keyturn window link (test mode): ${url}`); return; }
   const edge = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find((f) => fs.existsSync(f));
   if (!edge) return;
-  spawn(edge, [`--app=http://127.0.0.1:${PORT}/`, `--user-data-dir=${path.join(LOCAL, 'window')}`, '--window-size=1180,820', '--no-first-run', '--no-default-browser-check', '--disable-sync'], { detached: true, stdio: 'ignore' }).unref();
+  spawn(edge, [`--app=${url}`, `--user-data-dir=${path.join(LOCAL, 'window')}`, '--window-size=1180,820', '--no-first-run', '--no-default-browser-check', '--disable-sync'], { detached: true, stdio: 'ignore' }).unref();
 }
 
 server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') { if (process.argv.includes('--open')) openWindow(); process.exit(0); }
+  if (e.code === 'EADDRINUSE') {
+    // Keyturn is already running: ask it for a window (only it can make the window's one-time link).
+    if (!process.argv.includes('--open')) process.exit(0);
+    let t = '';
+    try { t = fs.readFileSync(path.join(LOCAL, 'cli.token'), 'utf8').trim(); } catch { /* ignore */ }
+    fetch(`http://127.0.0.1:${PORT}/api/cli/window`, { method: 'POST', headers: { 'x-keyturn-cli': t } }).catch(() => {}).finally(() => process.exit(0));
+    return;
+  }
   throw e;
 });
 server.listen(PORT, '127.0.0.1', () => {
+  fs.writeFileSync(path.join(LOCAL, 'cli.token'), cliToken); // only now: a second launch must not replace the running copy's token
   console.log(`Keyturn on http://127.0.0.1:${PORT}  data=${DATA}  relay=${RELAY}`);
   if (process.argv.includes('--open')) openWindow();
 });

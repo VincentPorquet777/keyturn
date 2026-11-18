@@ -52,7 +52,20 @@ async function readSource(source) {
   return { file: { name: path.basename(file), data }, value: single ? text.trim() : undefined, label: file };
 }
 
+// Names a key must never be written over: Windows and tool settings that would break or change how programs start.
+const PROTECTED_ENV = new Set(['PATH', 'PATHEXT', 'TEMP', 'TMP', 'COMSPEC', 'PSMODULEPATH', 'USERPROFILE', 'USERNAME', 'USERDOMAIN', 'HOME', 'HOMEDRIVE', 'HOMEPATH',
+  'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA', 'PROGRAMFILES', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'ONEDRIVE', 'PROMPT',
+  'NODE_OPTIONS', 'NODE_PATH', 'PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'PERL5OPT', 'RUBYOPT',
+  'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS', 'DOTNET_STARTUP_HOOKS', 'COR_ENABLE_PROFILING', 'COR_PROFILER', 'COR_PROFILER_PATH',
+  'CORECLR_ENABLE_PROFILING', 'CORECLR_PROFILER', 'CORECLR_PROFILER_PATH', 'KEYTURN_PORT', 'KEYTURN_DATA', 'KEYTURN_LOCAL', 'KEYTURN_RELAY']);
+function checkEnvName(name) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name || '')) throw new Error('Bad variable name');
+  if (PROTECTED_ENV.has(String(name).toUpperCase())) throw new Error(`${name} is a Windows or tool setting; choose another name`);
+  return name;
+}
+
 async function setUserEnv(name, value) {
+  checkEnvName(name);
   await ps(`${UTF8}[Environment]::SetEnvironmentVariable($env:KT_NAME, [Console]::In.ReadToEnd(), 'User')`, value, { KT_NAME: name });
 }
 
@@ -60,9 +73,30 @@ function quote(v) {
   if (/^[A-Za-z0-9_\-.:/@+=,]*$/.test(v)) return v;
   return '"' + v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"';
 }
-async function writeDotenv(file, name, value) {
-  const f = path.resolve(file);
-  if (!fs.existsSync(path.dirname(f))) throw new Error('Folder does not exist');
+// Where a key may be written as a .env line: a file called .env or .env.<something>, in an existing folder
+// on this PC (no network paths, so a value can't be sent to another computer), outside Keyturn's own folders.
+function dotenvTarget(file, forbiddenDirs = []) {
+  const f = path.resolve(String(file || ''));
+  const unc = (p) => /^[\\/]{2}/.test(p);
+  if (unc(String(file || '')) || unc(f)) throw new Error('The .env file must be on this PC, not a network path');
+  const base = path.basename(f);
+  if (!/^\.env(\.[A-Za-z0-9_-]{1,40})?$/.test(base)) throw new Error('Only a file named .env or .env.<name> can be written');
+  let dir;
+  try { dir = fs.realpathSync.native(path.dirname(f)); } catch { throw new Error('Folder does not exist'); }
+  if (unc(dir)) throw new Error('The .env file must be on this PC, not a network path');
+  const low = (p) => path.resolve(p).toLowerCase() + path.sep;
+  for (const d of forbiddenDirs) {
+    let real = d; try { real = fs.realpathSync.native(d); } catch { /* not there yet */ }
+    if (low(dir).startsWith(low(real)) || low(dir).startsWith(low(d))) throw new Error("Not inside Keyturn's own folders");
+  }
+  const target = path.join(dir, base);
+  if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) throw new Error('That .env is a link to somewhere else');
+  return target;
+}
+
+async function writeDotenv(file, name, value, forbiddenDirs = []) {
+  const f = dotenvTarget(file, forbiddenDirs);
+  checkEnvName(name);
   const lines = fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split(/\r?\n/) : [];
   const line = `${name}=${quote(value)}`;
   const i = lines.findIndex((l) => new RegExp(`^\\s*(export\\s+)?${name}\\s*=`).test(l));
@@ -72,7 +106,12 @@ async function writeDotenv(file, name, value) {
   fs.renameSync(tmp, f);
 }
 
-const setClipboard = (v) => ps(`${UTF8}$v=[Console]::In.ReadToEnd(); if($v){Set-Clipboard -Value $v}else{Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.Clipboard]::Clear()}`, v);
+// Copied values are marked so Windows keeps them out of clipboard history (Win+V), cloud clipboard sync and clipboard monitors.
+const setClipboard = (v) => ps(`${UTF8}Add-Type -AssemblyName System.Windows.Forms; $v=[Console]::In.ReadToEnd(); if($v){
+  $d=New-Object Windows.Forms.DataObject; $d.SetData([Windows.Forms.DataFormats]::UnicodeText, $v)
+  foreach($f in 'ExcludeClipboardContentFromMonitorProcessing','CanIncludeInClipboardHistory','CanUploadToCloudClipboard'){ $d.SetData($f, (New-Object IO.MemoryStream(,[byte[]](0,0,0,0)))) }
+  [Windows.Forms.Clipboard]::SetDataObject($d, $true, 10, 50)
+}else{ [Windows.Forms.Clipboard]::Clear() }`, v);
 const getClipboard = () => ps(`${UTF8}$c=Get-Clipboard -Raw; if($c){[Console]::Out.Write($c)}`, '');
 
-module.exports = { readSource, setUserEnv, writeDotenv, setClipboard, getClipboard };
+module.exports = { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard };
