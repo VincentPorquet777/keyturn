@@ -9,7 +9,7 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $Version = '1.0.0'
-$ZipSha256 = '5fd641d589c71245eebc8e119fc3df56e573c822ad9e675e5078e5cc558a7f85'
+$ZipSha256 = '59071a0fc86657a7aed2b6455e583ec920b7d115c438f2971bd81968178b9e34'
 $ZipUrl = "https://github.com/VincentPorquet777/keyturn/releases/download/v$Version/keyturn-$Version-windows.zip"
 $NodeVersion = 'v24.22.3'
 $Port = 7457

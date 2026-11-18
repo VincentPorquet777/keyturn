@@ -19,9 +19,9 @@ Open PowerShell and run:
 irm https://keys.aiforge.uk/install.ps1 | iex
 ```
 
-It installs Keyturn for your Windows account only (no admin rights), adds **Keyturn** to your desktop and Start menu, and puts the `keyturn` command on your PATH for your assistant. It needs Node.js 20 or later, and offers to install it with `winget` if it's missing.
+It installs Keyturn for your Windows account only (no admin rights), adds **Keyturn** to your desktop and Start menu, and puts the `keyturn` command on your PATH for your assistant. It brings its own copy of Node.js from nodejs.org, so there's nothing else to install, and it checks every download against its fingerprint. Run the same line again to update.
 
-To remove it: `keyturn-uninstall` (your vault is kept).
+To remove it: Settings > Apps > Keyturn, or `keyturn-uninstall`. Your vault is kept.
 
 Your phone needs Chrome on Android or Safari on iPhone (iOS 18 or later), with a screen lock.
 
