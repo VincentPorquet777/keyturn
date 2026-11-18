@@ -1,14 +1,21 @@
 {
-  "name": "app",
+  "name": "keyturn",
   "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "private": true,
+  "description": "Your passwords and API keys, opened by your phone's fingerprint, and handled by your AI assistant.",
+  "main": "server.js",
+  "bin": {
+    "keyturn": "keyturn.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "scripts": {
+    "start": "node server.js --open"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Vincent Porquet (Ai Forge)",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/VincentPorquet777/keyturn",
   "dependencies": {
     "hash-wasm": "^4.13.0",
     "kdbxweb": "^2.1.1",

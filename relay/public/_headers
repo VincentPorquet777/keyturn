@@ -5,3 +5,6 @@
   Permissions-Policy: publickey-credentials-get=(self), publickey-credentials-create=(self), camera=(), microphone=(), geolocation=()
   Strict-Transport-Security: max-age=31536000
   Cache-Control: no-cache
+
+/install.ps1
+  Content-Type: text/plain; charset=utf-8

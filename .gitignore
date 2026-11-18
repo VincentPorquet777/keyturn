@@ -3,3 +3,5 @@ relay/.wrangler/
 *.log
 tests/.runtime/
 tests/.runtime-*.log
+dist/
+tests/results-*.json

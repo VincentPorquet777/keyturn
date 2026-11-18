@@ -1,63 +1,100 @@
 # Keyturn
 
-Your passwords and keys, unlocked with your phone's fingerprint.
+**Your passwords and API keys, opened by your phone's fingerprint, and handled by your AI assistant.**
 
-Keyturn keeps every secret in one encrypted vault on this PC. To open it you scan a QR code with your phone and touch the fingerprint sensor. The vault opens for a set time (15 minutes, and you can add more), then locks itself again. Your assistant can sort, rename and file your keys while it is open, but it only ever sees their **names**, never the values.
+Keyturn keeps every secret in one encrypted vault on your PC. To open it, scan a code with your phone and touch the fingerprint sensor. It stays open for 15 minutes, then locks itself. While it's open, your AI assistant (Claude Code, Codex, Hermes or any agent with a terminal) can file new keys, sort them, find duplicates and put a key where a program needs it, by name, without printing it.
 
-## Everyday use
+Download an API key, tell your assistant "put it in Keyturn", touch your fingerprint, done: the key is in the vault and the downloaded file is in the Recycle Bin.
 
-1. Double-click **Keyturn** on the desktop.
-2. Scan the QR code with your phone's camera and confirm with your fingerprint.
-3. Before you touch the sensor, check that the four-digit match code on your phone is the same as on the PC. Only scan codes your own PC is showing you, and never open a Keyturn link someone sends you.
-4. The vault is open. It locks by itself when the timer runs out, or press **Lock now**.
+- **Your phone is the key.** A passkey with the fingerprint or face check, nothing to type, no master password to forget or leak.
+- **A recovery code on paper is the spare key,** like a crypto wallet's. Lose both and nobody can open it, including us.
+- **It's a normal KeePass file** (KDBX 4, Argon2id), so your secrets are never locked into Keyturn.
+- **Free and open source** (Apache-2.0). Fully AI-coded: its author hasn't written a line of it by hand.
 
-Copying a value puts it on the clipboard for 30 seconds, then clears it (also when the vault locks). Keyturn keeps copied values out of Windows clipboard history and cloud clipboard, but while a value is on the clipboard any program on this PC can read it.
+## Install (Windows 10 or 11)
+
+Open PowerShell and run:
+
+```powershell
+irm https://keys.aiforge.uk/install.ps1 | iex
+```
+
+It installs Keyturn for your Windows account only (no admin rights), adds **Keyturn** to your desktop and Start menu, and puts the `keyturn` command on your PATH for your assistant. It needs Node.js 20 or later, and offers to install it with `winget` if it's missing.
+
+To remove it: `keyturn-uninstall` (your vault is kept).
+
+Your phone needs Chrome on Android or Safari on iPhone (iOS 18 or later), with a screen lock.
 
 ## First set-up (once)
 
-1. Open Keyturn. It shows a QR code.
-2. Scan it with your phone, create the passkey, and confirm with your fingerprint.
-3. Your phone shows a four-digit code. Check the PC shows the same code and click **Yes, it matches**. If the codes differ, click **No**: someone else may have scanned your QR code.
-4. Keyturn shows a **24-character recovery code**. Write it on paper and keep it somewhere safe. It is the only way in if you lose your phone. Nobody else, including your assistant, ever sees it.
-5. To add a second phone later, open the vault and choose **Link another phone** under *Your phones*, then check the code the same way.
+1. Open **Keyturn**. It shows a QR code.
+2. Scan it with your phone's camera, tap the link, create the passkey and confirm with your fingerprint.
+3. Your phone shows a four-digit code. Check the PC shows the same one and click **Yes, it matches**. If they differ, click **No**: someone else may have scanned your code.
+4. Keyturn shows a **24-character recovery code**. Write it on paper, keep it somewhere safe and offline. It is shown once.
+
+## Everyday use
+
+1. Open **Keyturn** (or your assistant asks for it: `keyturn open "why"`).
+2. Scan the code with your phone. Before you touch the sensor, check the four-digit code on your phone matches the PC.
+3. It's open for 15 minutes (5 to 60, your choice; **+15 min** adds more), then locks itself. **Lock now** locks it straight away.
+
+**Copy** puts a value on the clipboard for 30 seconds, kept out of Windows clipboard history and cloud sync, and clears it when the vault locks.
+
+## For your assistant
+
+Paste this into your assistant's instructions (`CLAUDE.md`, `AGENTS.md`, a Hermes skill…):
+
+```text
+Secrets live in Keyturn. Never print, echo or log a secret value.
+- keyturn status                       locked or open
+- keyturn open "<why>"                 asks me to unlock with my phone; waits up to 3 minutes
+- keyturn list                         every key by name (never values)
+- keyturn take <group> <title> <file>  file a loose key file (e.g. a download) and move the original to the Recycle Bin
+- keyturn add <group> <title> <source> file a key and keep the source (source: path, env:NAME or dpapi:path)
+- keyturn import <manifest.json>       file many: [{"group","title","source"}]
+- keyturn move/rename/remove ...       tidy up; remove goes to the vault's recycle bin
+- keyturn dupes                        keys that hold the same value
+- keyturn wire <group/title> NAME [--dotenv <file>]   put a key into a Windows user setting or a .env file
+- keyturn lock                         lock when done
+```
+
+`wire --dotenv` only writes a file named `.env` or `.env.<name>`, in an existing folder on this PC, and `wire` refuses Windows settings such as `PATH`. `take` refuses `.env` files and SSH keys, because programs read those in place: use `add` for them.
+
+## How it's protected
+
+- Your phone's passkey gives a secret that never leaves the phone unencrypted. It reaches your PC end-to-end encrypted (P-256, AES-256-GCM) through a relay that only passes sealed messages.
+- That secret, combined with a second secret kept only on this PC (encrypted by Windows for your account), opens the vault key. A captured phone answer plus copies of your Keyturn files isn't enough on its own.
+- The paper recovery code opens the vault key too, on any PC. Its sealed copy is stored inside the vault file itself, so the vault file plus the paper code is all you need to recover.
+- **Unlinking a phone or making a new recovery code changes the vault key.** Old backups of the settings file no longer open today's vault with that phone or that code.
+- The local service only answers this PC. Each Keyturn window gets a one-time key when it opens, so web pages and other Windows accounts can't use the service.
+- Every action is listed in the window as it happens, marked as yours or your assistant's.
+
+## What it doesn't protect against
+
+Please read this part.
+
+- **Programs running as you while the vault is open.** Anything running under your Windows account (your assistant, a script, malware) can reach your keys while the vault is open: by working the Keyturn window, reading the clipboard or the screen, or tampering with Keyturn before your next unlock. "Names only" is how the assistant tool behaves, not a wall around your assistant. Keep the vault locked when you're not using it.
+- **Keys you put somewhere.** Once a key is in a `.env` file or a Windows setting, it is plain text there.
+- **The phone page.** It's served from keys.aiforge.uk. Whoever controls that site could capture your phone's answer the next time you unlock. That alone doesn't open your vault (the PC secret is also needed), but you are trusting that site.
+- **Copies made before a change.** A copy of the vault file made *before* you unlinked a phone still opens with that phone, as it was then. Changing keys can't un-copy data.
+- **Losing both your phones and your paper code.** There is no back door.
 
 ## Where things live
 
 | What | Where |
 | --- | --- |
-| Encrypted vault, its settings (`keyturn.json`) and activity log | `Documents\Keyturn\` (often synced to OneDrive) |
-| Window profile, tokens, settings | `%LOCALAPPDATA%\Keyturn\` |
-| Phone page and relay | `https://keys.aiforge.uk` (sees only encrypted traffic) |
+| Encrypted vault, its settings (`keyturn.json`) and activity log | `Documents\Keyturn\` |
+| This PC's secret, window profile, tokens | `%LOCALAPPDATA%\Keyturn\` |
+| The program | `%LOCALAPPDATA%\Programs\Keyturn\` |
+| Phone page and relay | `https://keys.aiforge.uk` |
 | Local service | `http://127.0.0.1:7457` (this PC only) |
 
-The vault is a standard KeePass (KDBX4) file, so it is not locked into Keyturn. An emergency export of its key, so it can be opened in KeePassXC, is not built yet.
+Back up `Documents\Keyturn\vault.kdbx`. With it and your paper code you can always get back in, even on a new PC.
 
-## How it is protected
+## Tests
 
-- Your phone's passkey produces a secret that never leaves the phone unencrypted. It is sent to the PC end to end encrypted (P-256 key exchange, AES-256-GCM). The relay only passes sealed messages along.
-- That secret unwraps the vault key. The recovery code unwraps it too, as a backup. The vault itself is KDBX4 with Argon2id.
-- A copy of the vault files on its own is useless: opening it needs your phone or your recovery code.
-- The local service only answers this PC. Each Keyturn window gets a one-time key when it opens; web pages and other Windows accounts on this PC can't use the service.
-- The assistant tool cannot print a value. It can save files into the vault, move, rename, remove, find duplicates, and put a key into a Windows setting or a `.env` file where a program needs it.
+`node tests/run.cjs` (the security audit: every finding with its proof and fix), `node tests/v2.cjs` (key changes, upgrades, recovery) and `node tests/take.cjs`. They run a separate test copy on port 17457 and never touch your real vault.
 
-## What it does not protect against
+## Licence
 
-- **Programs running as you while the vault is open.** Any program running under your Windows account (your assistant, a script, or malware) can get your keys while the vault is open, for example by working the Keyturn window, or by reading the clipboard or the screen. Such a program can also change Keyturn itself so that it leaks your keys the next time you unlock. "Names only" is how the assistant tool behaves. It is not a wall around your assistant. Only give your assistant a vault you would trust it with.
-- **Keys you put somewhere.** Once a key is in a `.env` file or a Windows setting, it is plain text there, and any program running as you, including your assistant, can read it.
-- **The phone page.** The relay can't read your messages, but the phone page's code comes from keys.aiforge.uk. Whoever controls that site could capture your passkey secret the next time you unlock. With a copy of your Keyturn files, that opens the vault.
-- **Old copies of `keyturn.json`.** Unlinking a phone or making a new recovery code stops it working with the current `keyturn.json`. But an older copy (a backup, or OneDrive's version history) together with that phone or old code still opens the vault, because the vault key itself doesn't change.
-- **Losing `keyturn.json`.** The recovery code works only together with `keyturn.json`. Back up `keyturn.json` along with `vault.kdbx`.
-
-## For your assistant
-
-```
-node app\keyturn.js status
-node app\keyturn.js open "Why I need it"   # shows you the unlock window; waits for your fingerprint
-node app\keyturn.js list
-node app\keyturn.js import <manifest.json> # [{ "group", "title", "source" }]
-node app\keyturn.js dupes
-node app\keyturn.js wire "<group>/<title>" NAME [--dotenv <file>]
-node app\keyturn.js lock
-```
-
-`source` is a path from your home folder, a full path, `env:NAME` or `dpapi:path`. `wire --dotenv` only writes a file named `.env` or `.env.<name>` in an existing folder on this PC, and `wire` won't write over Windows settings such as `PATH`.
+Apache-2.0. Made by [Ai Forge](https://aiforge.uk).
