@@ -2,6 +2,9 @@
 // Keyturn local service. Listens on 127.0.0.1 only.
 // - The app window (ui/) is what the owner uses: set up, unlock with phone, lock, copy, devices.
 // - The CLI (keyturn.js) is what an assistant uses: names only, never values, and only while unlocked.
+// - Server mode (Linux/macOS, or KEYTURN_HEADLESS=1): no window. The assistant gets a phone link to send the
+//   owner in their private chat; the owner confirms a link by telling the assistant the code their phone shows,
+//   and the paper recovery code is shown on the phone only, never to the assistant or the chat.
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
@@ -11,11 +14,10 @@ const QRCode = require('qrcode');
 const K = require('./lib/kcrypto');
 const { Vault } = require('./lib/vault');
 const { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret, recycle } = require('./lib/system');
+const { HEADLESS, DATA, LOCAL } = require('./lib/paths');
 
 const PORT = +process.env.KEYTURN_PORT || 7457;
 const RELAY = (process.env.KEYTURN_RELAY || 'https://keys.aiforge.uk').replace(/\/$/, '');
-const DATA = process.env.KEYTURN_DATA || path.join(os.homedir(), 'Documents', 'Keyturn');
-const LOCAL = process.env.KEYTURN_LOCAL || path.join(process.env.LOCALAPPDATA || os.homedir(), 'Keyturn');
 const PC = (process.env.KEYTURN_PC_NAME || os.hostname()).slice(0, 40);
 const CFG = path.join(DATA, 'keyturn.json');
 const VAULT = path.join(DATA, 'vault.kdbx');
@@ -23,8 +25,9 @@ const ACTIVITY = path.join(DATA, 'activity.log');
 const UI = path.join(__dirname, 'ui');
 const CHANNEL_MS = 3 * 60 * 1000;
 
-fs.mkdirSync(DATA, { recursive: true });
-fs.mkdirSync(LOCAL, { recursive: true });
+if (process.platform !== 'win32') process.umask(0o077); // everything Keyturn writes is for this account only
+fs.mkdirSync(DATA, { recursive: true, mode: 0o700 });
+fs.mkdirSync(LOCAL, { recursive: true, mode: 0o700 });
 
 // The window's key is never put inside a page. Each window Keyturn opens gets a one-time link (#k=...) that it
 // trades for the key once. A second use of the same link means another program got there first.
@@ -113,7 +116,7 @@ async function startChannel(kind) {
   const salt = cfg ? K.b64u.dec(cfg.prfSalt) : K.random(32);
   const mode = kind === 'unlock' ? 'u' : 'e';
   const name = encodeURIComponent(PC).replace(/\./g, '%2E');
-  const url = `${RELAY}/#v1.${mode}.${c.id}.${c.pub}.${K.b64u.enc(salt)}.${name}.${minutes()}`;
+  const url = `${RELAY}/#v1.${mode}.${c.id}.${c.pub}.${K.b64u.enc(salt)}.${name}.${minutes()}${HEADLESS ? '.s' : ''}`;
   const qr = await QRCode.toString(url, { type: 'svg', errorCorrectionLevel: 'Q', margin: 0, color: { dark: '#0C1016', light: '#0000' } });
   // Unlock: the code comes from the QR, so you can compare it before touching the sensor.
   // Linking a phone: the code comes from the phone that answered, and shows here only after it answers.
@@ -132,7 +135,7 @@ async function startChannel(kind) {
     if (msg.type !== 'payload') return;
     const link = p.kind !== 'unlock';
     let result;
-    if (link && p.answer) result = { ok: false, message: 'Another phone already answered this code. Start again on your PC.' };
+    if (link && p.answer) result = { ok: false, message: `Another phone already answered this code. ${HEADLESS ? 'Ask your assistant for a new link.' : 'Start again on your PC.'}` };
     else {
       p.status = 'verifying'; push();
       try { result = link ? takeLink(p, msg) : await handlePhone(p, msg); } catch (e) { result = { ok: false, message: e.expose ? e.message : 'Something went wrong on the PC.' }; if (!e.expose) console.error(e); }
@@ -176,13 +179,30 @@ function takeLink(p, msg) {
   p.code = K.linkCode(p.channel, msg);
   p.status = 'confirm';
   p.error = null;
+  p.tries = 0;
   push();
+  if (HEADLESS) {
+    // The paper code is made now and shown on this phone only (sealed, so the relay can't read it). It opens
+    // the vault only if the owner then confirms this phone's code to their assistant.
+    if (p.kind === 'enroll') p.recoveryCode = K.newRecoveryCode();
+    return { ok: true, message: 'Tell your assistant the code', detail: p.recoveryCode ? 'tell.' + K.sealReply(p.channel, msg, p.recoveryCode) : 'tell' };
+  }
   return { ok: true, message: 'Now check your PC', detail: 'confirm' };
 }
 
-async function confirmLink() {
+async function confirmLink(given) {
   const p = pending;
   if (!p || p.status !== 'confirm' || !p.answer) throw httpErr(409, 'Nothing to confirm.');
+  if (HEADLESS) {
+    // The owner reads the code off their own phone. A phone that answered someone else's copy of the link
+    // shows a different code, so it can't be confirmed by mistake.
+    const digits = String(given || '').replace(/\D/g, '');
+    if (digits !== p.code.replace(/\D/g, '')) {
+      p.tries = (p.tries || 0) + 1;
+      if (p.tries >= 3) { cancelChannel(); log('system', 'Phone link cancelled: the code was wrong 3 times'); throw httpErr(403, 'Wrong code 3 times, so this link was cancelled. Start again with keyturn setup.'); }
+      throw httpErr(403, 'That is not the code this phone sent. Ask the owner to read the four digits on their phone again.');
+    }
+  }
   const data = p.answer;
   p.answer = null;
   const credId = K.b64u.dec(data.cred);
@@ -194,7 +214,8 @@ async function confirmLink() {
       const key = K.random(32);
       const vaultId = K.b64u.enc(K.random(16));
       const vault = await Vault.create(VAULT, key, 'Keyturn');
-      const code = K.newRecoveryCode();
+      const code = p.recoveryCode || K.newRecoveryCode();
+      p.recoveryCode = null;
       const rec = await makeRecovery(code, key);
       vault.setRecovery(rec);
       await vault.save();
@@ -205,8 +226,8 @@ async function confirmLink() {
       };
       saveCfg();
       startSession(key, vault);
-      freshRecovery = code;
-      log('you', `Linked ${cfg.devices[0].name} and created the vault`);
+      if (!HEADLESS) freshRecovery = code; // server mode: it was shown on the phone, and nowhere else
+      log('you', `Linked ${cfg.devices[0].name} and created the vault${HEADLESS ? ' (recovery code shown on the phone)' : ''}`);
     } else {
       if (!session) throw httpErr(423, 'The vault locked before you confirmed.');
       if (cfg.devices.some((d) => d.cred === data.cred)) throw httpErr(409, 'This phone is already linked.');
@@ -228,7 +249,7 @@ async function handlePhone(p, msg) {
   const credId = K.b64u.dec(data.cred);
   const prf = K.b64u.dec(data.prf);
   const d = cfg.devices.find((x) => x.cred === data.cred);
-  if (!d) throw httpErr(403, 'This passkey isn’t linked to this PC.');
+  if (!d) throw httpErr(403, HEADLESS ? `This passkey isn’t linked to ${PC}.` : 'This passkey isn’t linked to this PC.');
   let key;
   let upgrade = false;
   try {
@@ -444,7 +465,7 @@ function serveUi(res, p) {
 async function ui(p, b) {
   switch (p) {
     case '/api/setup': if (cfg) throw httpErr(409, 'Already set up'); if (fs.existsSync(VAULT)) throw httpErr(409, EXISTING_VAULT); await startChannel('enroll'); return;
-    case '/api/link/confirm': await confirmLink(); return;
+    case '/api/link/confirm': if (HEADLESS) throw httpErr(400, 'In server mode the owner confirms through their assistant.'); await confirmLink(); return;
     case '/api/ping': return { ok: true };
     case '/api/unlock': await startChannel('unlock'); return;
     case '/api/addphone': await startChannel('addphone'); return;
@@ -542,17 +563,46 @@ async function ui(p, b) {
 // ---------- assistant CLI: names only ----------
 async function cli(req, cmd, b) {
   switch (cmd) {
-    case 'status': return { setup: !!cfg, locked: !session, expiresAt: session && session.expiresAt, pending: pending && pending.status, request };
+    case 'status': return { setup: !!cfg, locked: !session, expiresAt: session && session.expiresAt, pending: pending && pending.status, request, server: HEADLESS, ...(HEADLESS && pending ? { kind: pending.kind, link: pending.url } : {}) };
     case 'window': openWindow(); return { ok: true }; // the desktop icon, clicked while Keyturn is already running
     case 'open': {
       if (session) return { ok: true, message: 'Already open' };
       request = { reason: String(b.reason || 'Your assistant would like to sort your keys').slice(0, 140), at: new Date().toISOString() };
+      if (HEADLESS) {
+        if (!cfg) throw httpErr(409, 'Not set up yet: run keyturn setup first.');
+        if (!pending || pending.kind !== 'unlock' || ['expired', 'offline'].includes(pending.status)) await startChannel('unlock');
+        log('assistant', `Asked to open the vault: ${request.reason}`);
+        return { ok: true, link: pending.url, code: pending.code, minutes: minutes(), message: 'Send the owner this link' };
+      }
       if (cfg && !session && !pending) await startChannel('unlock');
       openWindow();
       log('assistant', `Asked to open the vault: ${request.reason}`);
       return { ok: true, message: 'Unlock window shown to the owner' };
     }
     case 'lock': needOpen(); lock('assistant'); return { ok: true };
+    // ---- server mode: the owner sets up and links phones through their assistant ----
+    case 'setup': {
+      if (!HEADLESS) throw httpErr(400, 'Set up from the Keyturn window.');
+      if (cfg) throw httpErr(409, 'Already set up.');
+      if (fs.existsSync(VAULT)) throw httpErr(409, EXISTING_VAULT);
+      await startChannel('enroll');
+      log('assistant', 'Started set-up: link sent to the owner');
+      return { ok: true, link: pending.url };
+    }
+    case 'addphone': {
+      if (!HEADLESS) throw httpErr(400, 'Link phones from the Keyturn window.');
+      needOpen();
+      await startChannel('addphone');
+      log('assistant', 'Started linking another phone');
+      return { ok: true, link: pending.url };
+    }
+    case 'confirm': {
+      if (!HEADLESS) throw httpErr(400, 'Confirm in the Keyturn window.');
+      await confirmLink(b.code);
+      return { ok: true, setup: true, locked: !session, expiresAt: session && session.expiresAt };
+    }
+    case 'cancel': cancelChannel(); return { ok: true };
+    case 'devices': return { devices: cfg ? cfg.devices.map((d) => ({ name: d.name, created: d.created, lastUsed: d.lastUsed })) : [] };
     case 'list': needOpen(); return { entries: session.vault.list(), summary: session.vault.summary(), expiresAt: session.expiresAt };
     case 'dupes': {
       needOpen();
@@ -617,6 +667,7 @@ async function cli(req, cmd, b) {
       let where;
       let label;
       if (b.dotenv) { await writeDotenv(b.dotenv, b.name, secret, keyturnDirs); where = `${b.dotenv} (${b.name})`; label = `${path.basename(path.dirname(b.dotenv))}${path.sep}${path.basename(b.dotenv)} (${b.name})`; }
+      else if (HEADLESS) throw httpErr(400, 'On this computer a key can only go into a .env file: add --dotenv <file>');
       else { await setUserEnv(b.name, secret); where = `Windows setting ${b.name}`; label = where; }
       session.vault.markUsed(b.ref, where);
       await saveVault('assistant', `Put into ${label}`, [b.ref]);
@@ -627,6 +678,7 @@ async function cli(req, cmd, b) {
 }
 
 function openWindow() {
+  if (HEADLESS && !process.env.KEYTURN_NO_WINDOW) return; // server mode: no window on this computer
   const url = `http://127.0.0.1:${PORT}/#k=${newLaunch()}`;
   if (process.env.KEYTURN_NO_WINDOW) { console.log(`Keyturn window link (test mode): ${url}`); return; }
   const edge = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find((f) => fs.existsSync(f));
@@ -647,7 +699,7 @@ server.on('error', (e) => {
 });
 server.listen(PORT, '127.0.0.1', () => {
   fs.writeFileSync(path.join(LOCAL, 'cli.token'), cliToken); // only now: a second launch must not replace the running copy's token
-  console.log(`Keyturn on http://127.0.0.1:${PORT}  data=${DATA}  relay=${RELAY}`);
+  console.log(`Keyturn on http://127.0.0.1:${PORT}  data=${DATA}  relay=${RELAY}${HEADLESS ? '  (server mode)' : ''}`);
   if (process.argv.includes('--open')) openWindow();
 });
 module.exports = { server };

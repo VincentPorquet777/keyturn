@@ -97,3 +97,7 @@ h1 { margin: 0 0 6px; font-size: 27px; line-height: 1.2; letter-spacing: -.02em;
 @keyframes breathe { 50% { opacity: .45; transform: scale(.94); } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 @media (min-height: 760px) { .hero { padding-top: 10vh; } }
+
+/* Server mode: the paper recovery code, shown once on the phone */
+.rcode { display: block; margin: 4px auto 16px; padding: 14px 12px; color: var(--text); font: 600 19px/1.5 ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace; letter-spacing: .08em; background: rgba(255,255,255,.06); border-radius: 12px; word-break: break-word; user-select: all; }
+.sub b.code { font: 600 17px/1 ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace; letter-spacing: .18em; }

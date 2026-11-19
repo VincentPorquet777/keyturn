@@ -1,5 +1,6 @@
 // Keyturn phone page. Opened from the QR code on the PC.
-// Link format: #v1.<mode e|u>.<channel>.<pc public key>.<prf salt>.<pc name>.<minutes>
+// Link format: #v1.<mode e|u>.<channel>.<pc public key>.<prf salt>.<pc name>.<minutes>[.s]
+// ".s" = server mode: the link came from the owner's assistant, not a QR code on a PC screen.
 // The phone never receives a password. It only proves "it's me" with a fingerprint and
 // sends the passkey's PRF output, encrypted to the PC's one-time key.
 (() => {
@@ -44,9 +45,9 @@
   function parse() {
     const parts = location.hash.slice(1).split('.');
     if (parts[0] !== 'v1' || parts.length < 7) return null;
-    const [, mode, ch, pub, salt, name, mins] = parts;
+    const [, mode, ch, pub, salt, name, mins, flags] = parts;
     if (!/^[eu]$/.test(mode) || !/^[A-Za-z0-9_-]{22}$/.test(ch)) return null;
-    return { mode, ch, pub, salt, name: decodeURIComponent(name || 'your PC').slice(0, 40), mins: Math.max(1, Math.min(240, +mins || 15)) };
+    return { mode, ch, pub, salt, name: decodeURIComponent(name || 'your PC').slice(0, 40), mins: Math.max(1, Math.min(240, +mins || 15)), server: flags === 's' };
   }
 
   async function matchCode(p) {
@@ -80,6 +81,17 @@
     const iv = rand(12);
     const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(p.ch) }, key, te.encode(JSON.stringify(payload)));
     return { pub: b64u.enc(await crypto.subtle.exportKey('raw', p.eph.publicKey)), iv: b64u.enc(iv), ct: b64u.enc(ct) };
+  }
+
+  // Server mode: the PC seals the paper recovery code to this phone with the same key exchange, so the relay
+  // can't read it. (Same derivation as sealReply() in app/lib/kcrypto.js.)
+  async function openReply(p, sealed) {
+    await prepare(p);
+    const [iv, ct] = String(sealed).split('.');
+    const hk = await crypto.subtle.importKey('raw', p.shared, 'HKDF', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: te.encode(p.ch), info: te.encode('keyturn reply v1') }, hk, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64u.dec(iv), additionalData: te.encode(p.ch + '.reply') }, key, b64u.dec(ct));
+    return new TextDecoder().decode(plain);
   }
 
   async function send(p, payload, workingTitle) {
@@ -165,7 +177,20 @@
   }
 
   async function finishEnroll(p, rawId, first) {
-    const j = await send(p, { t: 'enroll', cred: b64u.enc(rawId), prf: b64u.enc(first), device: deviceName() }, 'Linking to your PC…');
+    const j = await send(p, { t: 'enroll', cred: b64u.enc(rawId), prf: b64u.enc(first), device: deviceName() }, p.server ? 'Linking…' : 'Linking to your PC…');
+    if (j.detail === 'tell' || String(j.detail).startsWith('tell.')) {
+      const last = () => done('Last step', `Tell your assistant this code: <b class="code">${esc(p.code)}</b><br>That finishes linking this phone to <b>${esc(p.name)}</b>.`);
+      if (j.detail === 'tell') return last();
+      const code = await openReply(p, j.detail.slice(5));
+      history.replaceState(null, '', location.pathname);
+      return show('ready', {
+        title: 'Your recovery code',
+        sub: `<span class="rcode">${esc(code)}</span>Write it on paper now. It is shown once, and it is the only way back in if you lose this phone. Don’t screenshot it or send it to anyone, your assistant included.`,
+        button: 'I’ve written it down',
+        quiet: true,
+        onClick: async () => last(),
+      });
+    }
     if (j.detail === 'confirm') return done('Now check your PC', `If <b>${esc(p.name)}</b> shows <b>${esc(p.code)}</b>, click <b>Yes, it matches</b> there. If it shows a different code, click <b>No</b>.`);
     done('This phone is your key', `Finish on <b>${esc(p.name)}</b>: it’s showing your recovery code.`);
   }
@@ -204,6 +229,7 @@
     const code = p.mode === 'u' ? await matchCode(p) : await linkCode(p);
     p.code = code;
     $('matchCode').textContent = code;
+    $('matchText').textContent = !p.server ? 'Check your PC shows' : p.mode === 'u' ? 'Your assistant’s message says' : 'Your code:';
     $('match').hidden = false;
     fetch(`/api/ch/${p.ch}/hello`, { method: 'POST' }).then((r) => { if (r.status === 410) fail(new KtError('expired')); }).catch(() => {});
     if (p.mode === 'u') {
@@ -212,7 +238,7 @@
         sub: `on <b>${esc(p.name)}</b>`,
         facts: [
           ['clock', `Opens for ${p.mins} minutes, then locks itself`],
-          ['shield', 'Your passwords stay on your PC. Nothing secret comes to this phone'],
+          ['shield', p.server ? `Your keys stay on ${esc(p.name)}. Nothing secret comes to this phone` : 'Your passwords stay on your PC. Nothing secret comes to this phone'],
           ['pc', 'Only you can approve this, with your fingerprint or face'],
         ],
         button: 'Unlock with fingerprint',
@@ -226,7 +252,7 @@
         facts: [
           ['key', 'Your phone saves a passkey, locked by your fingerprint or face'],
           ['shield', 'Your fingerprint never leaves this phone'],
-          ['note', 'Your PC then shows a recovery code, in case you lose this phone'],
+          ['note', p.server ? 'This phone then shows your recovery code once, for paper, in case you lose it' : 'Your PC then shows a recovery code, in case you lose this phone'],
         ],
         button: 'Create my passkey',
         onClick: () => doEnroll(p),

@@ -60,6 +60,34 @@ Secrets live in Keyturn. Never print, echo or log a secret value.
 
 `wire --dotenv` only writes a file named `.env` or `.env.<name>`, in an existing folder on this PC, and `wire` refuses Windows settings such as `PATH`. `take` refuses `.env` files and SSH keys, because programs read those in place: use `add` for them.
 
+## On a server, for an assistant that lives there (Linux)
+
+If your assistant runs on a server (a Hermes agent on a VPS, say), Keyturn runs there too, in **server mode**: there is no window, so your assistant sends you the links in your private chat.
+
+```sh
+curl -fsSL https://keys.aiforge.uk/install.sh | KEYTURN_NAME="My Assistant" sh
+```
+
+It installs for that Linux account only (no root), with its own Node.js checked against nodejs.org, and runs as a systemd user service. `KEYTURN_NAME` is the name your phone shows.
+
+**Set-up:** your assistant runs `keyturn setup` and sends you the link. Tap it, make the passkey with your fingerprint, and your phone shows two things:
+
+1. **Your recovery code.** Write it on paper. It is shown on your phone once and never reaches the server, the chat or your assistant.
+2. **Four digits.** Tell them to your assistant, which runs `keyturn confirm <digits>`. A phone that answered someone else's copy of the link shows different digits, so it can't be linked by mistake.
+
+**Unlocking:** when it needs a key, your assistant runs `keyturn open "why" --no-wait` and sends you the link; its message quotes the code your phone will show. Tap, touch the sensor, done. Keys can only go into `.env` files on that server (`wire ... --dotenv <file>`).
+
+Assistant instructions for server mode: the list under "For your assistant", plus
+
+```text
+- keyturn setup | addphone      prints a link: send it to the owner in your private chat with them, nowhere else
+- keyturn confirm <digits>      the four digits the owner reads off their phone (never guess them)
+- keyturn open "<why>" --no-wait, send the link, then keyturn wait
+- Never ask for, repeat or store the owner's recovery code.
+```
+
+To recover without your phone, copy `vault.kdbx` to a Windows PC with Keyturn and choose "Lost your phone?": the paper code and that file are all you need.
+
 ## How it's protected
 
 - Your phone's passkey gives a secret that never leaves the phone unencrypted. It reaches your PC end-to-end encrypted (P-256, AES-256-GCM) through a relay that only passes sealed messages.
@@ -89,11 +117,13 @@ Please read this part.
 | Phone page and relay | `https://keys.aiforge.uk` |
 | Local service | `http://127.0.0.1:7457` (this PC only) |
 
+On a Linux server: the vault in `~/.local/share/keyturn/`, the server's secret in `~/.local/state/keyturn/`, the program in `~/.local/share/keyturn-app/`, the service `keyturn` (`systemctl --user status keyturn`).
+
 Back up `Documents\Keyturn\vault.kdbx`. With it and your paper code you can always get back in, even on a new PC.
 
 ## Tests
 
-`node tests/run.cjs` (the security audit: every finding with its proof and fix), `node tests/v2.cjs` (key changes, upgrades, recovery) and `node tests/take.cjs`. They run a separate test copy on port 17457 and never touch your real vault.
+`node tests/run.cjs` (the security audit: every finding with its proof and fix), `node tests/v2.cjs` (key changes, upgrades, recovery) `node tests/take.cjs` and `node tests/server-mode.cjs` (server mode, also on Linux). They run a separate test copy on port 17457 and never touch your real vault.
 
 ## Licence
 

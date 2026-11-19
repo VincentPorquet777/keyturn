@@ -103,7 +103,7 @@ function loadPhoneLib() {
   grab(/const b64u = \{/, 'b64u');
   parts.push(src.match(/const te = new TextEncoder\(\);/)[0]);
   parts.push(src.match(/const rand = .*;/)[0]);
-  const names = ['parse', 'matchCode', 'prepare', 'linkCode', 'seal'];
+  const names = ['parse', 'matchCode', 'prepare', 'linkCode', 'seal', 'openReply'];
   const have = names.filter((n) => grab(new RegExp(`(async )?function ${n}\\(`), n));
   const body = `const location = L;\n${parts.join('\n')}\nreturn { ${have.join(', ')} };`;
   // eslint-disable-next-line no-new-func

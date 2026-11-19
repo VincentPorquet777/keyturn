@@ -72,6 +72,15 @@ function linkCode(channel, msg) {
   return String(h.readUInt32BE(0) % 10000).padStart(4, '0').replace(/(\d\d)(\d\d)/, '$1 $2');
 }
 
+// Server mode: the paper recovery code goes back to the phone that answered, sealed with the key exchange of
+// this channel, so the relay passes it without being able to read it. (Same derivation as openReply() in
+// relay/public/app.js.)
+function sealReply(channel, msg, text) {
+  const shared = channel.ecdh.computeSecret(b64u.dec(String(msg.pub)));
+  const key = Buffer.from(crypto.hkdfSync('sha256', shared, Buffer.from(channel.id), Buffer.from('keyturn reply v1'), 32));
+  try { const box = aesWrap(key, Buffer.from(text, 'utf8'), Buffer.from(channel.id + '.reply')); return `${box.iv}.${box.ct}`; } finally { key.fill(0); }
+}
+
 // ---------- v2 key boxes ----------
 // The vault key K is sealed to a P-256 public key (one per phone, one for the paper code). Sealing needs only
 // the public key, so Keyturn can change K and seal the new one again for every phone and the paper code without
@@ -115,4 +124,4 @@ function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('he
 function token() { return b64u.enc(random(24)); }
 function same(a, b) { return a.length === b.length && crypto.timingSafeEqual(a, b); }
 
-module.exports = { b64u, random, aesWrap, aesUnwrap, prfWrapKey, newRecoveryCode, normaliseCode, recoveryWrapKey, newChannel, openFromPhone, linkCode, sealTo, openWith, pubOf, phoneKey, recoveryKey, sha256, token, same };
+module.exports = { b64u, random, aesWrap, aesUnwrap, prfWrapKey, newRecoveryCode, normaliseCode, recoveryWrapKey, newChannel, openFromPhone, linkCode, sealReply, sealTo, openWith, pubOf, phoneKey, recoveryKey, sha256, token, same };

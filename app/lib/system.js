@@ -34,10 +34,11 @@ async function readSource(source) {
   if (/^env:/i.test(source)) {
     const name = source.slice(4);
     let value = process.env[name];
-    if (!value) value = (await ps(`${UTF8}$v=[Environment]::GetEnvironmentVariable($env:KT_NAME,'User'); if($v){[Console]::Out.Write($v)}`, '', { KT_NAME: name })) || undefined;
-    return value ? { value, label: `Windows setting ${name}` } : null;
+    if (!value && process.platform === 'win32') value = (await ps(`${UTF8}$v=[Environment]::GetEnvironmentVariable($env:KT_NAME,'User'); if($v){[Console]::Out.Write($v)}`, '', { KT_NAME: name })) || undefined;
+    return value ? { value, label: process.platform === 'win32' ? `Windows setting ${name}` : `environment ${name}` } : null;
   }
   if (/^dpapi:/i.test(source)) {
+    if (process.platform !== 'win32') throw new Error('dpapi: sources only exist on Windows');
     const file = resolveHome(source.slice(6));
     if (!fs.existsSync(file)) return null;
     const value = await ps(`${UTF8}$s=ConvertTo-SecureString ((Get-Content -Raw -LiteralPath $env:KT_FILE).Trim()); $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); try{[Console]::Out.Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR($b))}finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b)}`, '', { KT_FILE: file });
@@ -66,6 +67,7 @@ function checkEnvName(name) {
 
 async function setUserEnv(name, value) {
   checkEnvName(name);
+  if (process.platform !== 'win32') throw new Error('On this computer a key can only go into a .env file: add --dotenv <file>');
   await ps(`${UTF8}[Environment]::SetEnvironmentVariable($env:KT_NAME, [Console]::In.ReadToEnd(), 'User')`, value, { KT_NAME: name });
 }
 
@@ -107,14 +109,27 @@ async function writeDotenv(file, name, value, forbiddenDirs = []) {
 }
 
 // Copied values are marked so Windows keeps them out of clipboard history (Win+V), cloud clipboard sync and clipboard monitors.
-const setClipboard = (v) => ps(`${UTF8}Add-Type -AssemblyName System.Windows.Forms; $v=[Console]::In.ReadToEnd(); if($v){
+const setClipboard = (v) => process.platform !== 'win32' ? Promise.reject(new Error('No clipboard on this computer')) : ps(`${UTF8}Add-Type -AssemblyName System.Windows.Forms; $v=[Console]::In.ReadToEnd(); if($v){
   $d=New-Object Windows.Forms.DataObject; $d.SetData([Windows.Forms.DataFormats]::UnicodeText, $v)
   foreach($f in 'ExcludeClipboardContentFromMonitorProcessing','CanIncludeInClipboardHistory','CanUploadToCloudClipboard'){ $d.SetData($f, (New-Object IO.MemoryStream(,[byte[]](0,0,0,0)))) }
   [Windows.Forms.Clipboard]::SetDataObject($d, $true, 10, 50)
 }else{ [Windows.Forms.Clipboard]::Clear() }`, v);
 // Move a file to the Recycle Bin (recoverable), never a hard delete.
 async function recycle(file) {
-  if (process.platform !== 'win32') { const bin = path.join(os.homedir(), '.Trash'); fs.mkdirSync(bin, { recursive: true }); fs.renameSync(file, path.join(bin, path.basename(file))); return; }
+  if (process.platform !== 'win32') {
+    // The freedesktop Trash (what Linux file managers use); recoverable, never a hard delete.
+    const trash = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'Trash');
+    fs.mkdirSync(path.join(trash, 'files'), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(trash, 'info'), { recursive: true, mode: 0o700 });
+    let name = path.basename(file);
+    for (let i = 2; fs.existsSync(path.join(trash, 'files', name)); i++) name = `${path.basename(file)}.${i}`;
+    fs.writeFileSync(path.join(trash, 'info', name + '.trashinfo'), `[Trash Info]
+Path=${encodeURI(file)}
+DeletionDate=${new Date().toISOString().slice(0, 19)}
+`);
+    fs.renameSync(file, path.join(trash, 'files', name));
+    return;
+  }
   await ps(`${UTF8}Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:KT_FILE, 'OnlyErrorDialogs', 'SendToRecycleBin')`, '', { KT_FILE: file });
 }
 
@@ -139,6 +154,6 @@ async function pcSecret(file, create) {
   return s;
 }
 
-const getClipboard = () => ps(`${UTF8}$c=Get-Clipboard -Raw; if($c){[Console]::Out.Write($c)}`, '');
+const getClipboard = () => process.platform !== 'win32' ? Promise.resolve('') : ps(`${UTF8}$c=Get-Clipboard -Raw; if($c){[Console]::Out.Write($c)}`, '');
 
 module.exports = { readSource, setUserEnv, writeDotenv, dotenvTarget, checkEnvName, setClipboard, getClipboard, pcSecret, recycle };
