@@ -230,7 +230,7 @@
     p.code = code;
     $('matchCode').textContent = code;
     $('matchText').textContent = !p.server ? 'Check your PC shows' : p.mode === 'u' ? 'Your assistant’s message says' : 'Your code:';
-    $('match').hidden = false;
+    $('match').hidden = p.server && p.mode !== 'u'; // server set-up: the code comes on the last screen, after the recovery code
     fetch(`/api/ch/${p.ch}/hello`, { method: 'POST' }).then((r) => { if (r.status === 410) fail(new KtError('expired')); }).catch(() => {});
     if (p.mode === 'u') {
       show('ready', {
